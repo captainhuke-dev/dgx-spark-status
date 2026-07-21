@@ -794,6 +794,14 @@
                     <span class="model-size">{model.sizeGB} GB</span>
                     <span class="model-params">{model.name?.split('/')?.[0]}</span>
                   </div>
+                  {#if control?.runtime_details}
+                    <div class="model-runtime-details">
+                      <div><strong>Backend</strong> {control.runtime_details.backend}{#if control.runtime_details.attention} · Attention {control.runtime_details.attention}{/if}</div>
+                      <div><strong>MTP</strong> {control.runtime_details.mtp}{#if control.runtime_details.architecture} · CUTE DSL {control.runtime_details.architecture}{/if}{#if control.runtime_details.context} · ctx {control.runtime_details.context}{/if}</div>
+                      {#if control.runtime_details.stack}<div class="runtime-stack">{control.runtime_details.stack}</div>{/if}
+                      {#if control.runtime_details.apiAliasNote}<div class="runtime-alias-note">{control.runtime_details.apiAliasNote}</div>{/if}
+                    </div>
+                  {/if}
                   {#if control}
                     <div class="model-control">
                       <button class="control-btn secondary" disabled={(controlState.busy && controlState.verb === 'status') || !control.control_enabled} onclick={() => refreshModelStatus(control.profile_id)}>Status</button>
@@ -1386,6 +1394,28 @@
     overflow-y: auto;
     flex: 1;
   }
+
+  .model-runtime-details {
+    display: grid;
+    gap: 0.18rem;
+    margin-top: 0.35rem;
+    padding: 0.38rem 0.45rem;
+    border: 1px solid rgba(0, 212, 255, 0.28);
+    border-radius: 4px;
+    background: rgba(0, 212, 255, 0.05);
+    color: #c9d4d8;
+    font-size: 0.58rem;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+
+  .model-runtime-details strong {
+    color: #00d4ff;
+    font-weight: 700;
+  }
+
+  .runtime-stack { color: #9ba9ae; }
+  .runtime-alias-note { color: #ffd166; }
 
   .models-card h2 {
     display: flex;

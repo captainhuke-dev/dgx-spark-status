@@ -10,6 +10,7 @@ import {
   hermesErrorStatus,
   sendHermesLogo,
 } from './hermes-service.js';
+import { readModelRuntimeDetails } from './model-runtime-details.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -918,14 +919,18 @@ function envDisplayName(env) {
 
 function enrichModelControlProfile(profile = {}) {
   const displayName = dashboardModelDisplayName(profile);
-  if (!displayName) return profile;
+  const runtimeDetails = readModelRuntimeDetails(profile, readFileSync);
+  if (!displayName && !runtimeDetails) return profile;
 
   return {
     ...profile,
-    display_name: displayName,
-    model_name: displayName,
-    model_path: isPlaceholderModelName(profile.model_path) ? NEMOTRON3_MODEL_PATH : profile.model_path,
-    served_model_name: profile.api_model_id || profile.served_model_name
+    ...(displayName ? {
+      display_name: displayName,
+      model_name: displayName,
+      model_path: isPlaceholderModelName(profile.model_path) ? NEMOTRON3_MODEL_PATH : profile.model_path,
+      served_model_name: profile.api_model_id || profile.served_model_name
+    } : {}),
+    ...(runtimeDetails ? { runtime_details: runtimeDetails } : {})
   };
 }
 
