@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { subscribe, getCurrentMetrics, isWebSocketConnected } from './websocket.js';
   import Gauge from './Gauge.svelte';
+  import HermesSpotlight from './HermesSpotlight.svelte';
 
   let metrics = $state(null);
   let connected = $state(false);
@@ -13,13 +14,53 @@
   let gpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let netRxHistory = $state(Array(HISTORY_LEN).fill(0));
   let netTxHistory = $state(Array(HISTORY_LEN).fill(0));
+  let modelControls = $state([]);
+  let modelControlError = $state('');
+  let modelActions = $state({});
+  let ds4Action = $state({});
+  let modelControlTimer = null;
+  let graphTopology = $state(null);
+  let graphifyError = $state('');
+  let graphifyTimer = null;
+  let dgxHealth = $state(null);
+  let dgxHealthError = $state('');
+  let dgxHealthTimer = null;
+
+  const DGX_HEALTH_BASE_PORTS = [9000, 11000];
 
   function pushHistory(arr, val) {
     const next = [...arr.slice(1), val];
     return next;
   }
 
+  function isWifiNetwork(net) {
+    return net?.kind === 'wifi' || String(net?.iface || '').startsWith('wl');
+  }
+
+  function selectGraphNetwork(network = []) {
+    return network.find(isWifiNetwork) || network.find(n => n.iface === 'all') || network[0];
+  }
+
+  function visibleNetworkRows(network = []) {
+    return network.filter(n => n.iface !== 'all').slice(0, 4);
+  }
+
+  function formatNetworkSpeed(value) {
+    return Number(value || 0).toFixed(2);
+  }
+
+  function networkName(net) {
+    const label = net?.label || net?.kind || 'Network';
+    return `${label} ${net?.iface || ''}`.trim();
+  }
+
   onMount(() => {
+    loadModelControls();
+    loadGraphifyTopology();
+    loadDgxHealth();
+    modelControlTimer = setInterval(loadModelControls, 15000);
+    graphifyTimer = setInterval(loadGraphifyTopology, 5000);
+    dgxHealthTimer = setInterval(loadDgxHealth, 5000);
     unsubscribe = subscribe((message) => {
       if (message.type === 'connected') {
         connected = true;
@@ -29,7 +70,7 @@
         metrics = message.data;
         cpuHistory = pushHistory(cpuHistory, message.data.cpu?.usage || 0);
         gpuHistory = pushHistory(gpuHistory, message.data.gpu?.[0]?.utilizationGpu || 0);
-        const net = message.data.network?.find(n => n.iface === 'all') || message.data.network?.[0];
+        const net = selectGraphNetwork(message.data.network || []);
         netRxHistory = pushHistory(netRxHistory, net?.rx_sec_mb || 0);
         netTxHistory = pushHistory(netTxHistory, net?.tx_sec_mb || 0);
       }
@@ -40,7 +81,205 @@
 
   onDestroy(() => {
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    if (modelControlTimer) { clearInterval(modelControlTimer); modelControlTimer = null; }
+    if (graphifyTimer) { clearInterval(graphifyTimer); graphifyTimer = null; }
+    if (dgxHealthTimer) { clearInterval(dgxHealthTimer); dgxHealthTimer = null; }
   });
+
+  async function loadModelControls() {
+    try {
+      const res = await fetch('/api/model-control/list');
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.message || 'Model control list failed');
+      modelControls = data.profiles || [];
+      modelActions = Object.fromEntries(
+        Object.entries(modelActions).map(([profileId, state]) => [
+          profileId,
+          state?.busy ? state : {}
+        ]).filter(([, state]) => state?.busy)
+      );
+      modelControlError = '';
+    } catch (error) {
+      modelControlError = error.message || 'Model control unavailable';
+    }
+  }
+
+  async function loadGraphifyTopology() {
+    try {
+      const res = await fetch('/api/graphify/topology');
+      const data = await res.json();
+      if (!res.ok || data.ok === false) throw new Error(data.message || 'Graphify topology failed');
+      graphTopology = data;
+      graphifyError = '';
+    } catch (error) {
+      graphifyError = error.message || 'Graphify unavailable';
+    }
+  }
+
+  async function loadDgxHealth() {
+    try {
+      const res = await fetch('/api/dgx-health/latest');
+      const data = await res.json();
+      dgxHealth = data;
+      dgxHealthError = !res.ok || data.ok === false ? (data.error || 'DGX health unavailable') : '';
+    } catch (error) {
+      dgxHealth = null;
+      dgxHealthError = error.message || 'DGX health unavailable';
+    }
+  }
+
+  function normalizeControlKey(value) {
+    return String(value || '')
+      .split('/')
+      .filter(Boolean)
+      .pop()
+      ?.replace(/\.(gguf|safetensors|bin|pt|pth|env)$/i, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '') || '';
+  }
+
+  function modelControlKeys(model, runtimeModel) {
+    return [
+      model?.name,
+      model?.key,
+      model?.apiModel,
+      model?.modelAlias,
+      model?.modelPath,
+      model?.path,
+      runtimeModel?.name,
+      runtimeModel?.modelAlias,
+      runtimeModel?.apiModel,
+      runtimeModel?.path,
+      runtimeModel?.root
+    ].map(normalizeControlKey).filter(Boolean);
+  }
+
+  function profileControlKeys(profile) {
+    return [
+      profile?.profile_id,
+      profile?.display_name,
+      profile?.model_name,
+      profile?.served_model_name,
+      profile?.api_model_id,
+      profile?.model_path,
+      profile?.config_file
+    ].map(normalizeControlKey).filter(Boolean);
+  }
+
+  function controlForModel(model, runtimeModel, displayPort) {
+    const controls = modelControls;
+    const enabledControls = controls.filter(profile => profile.control_enabled);
+    const port = Number(displayPort || runtimeModel?.port || model?.port || 0);
+    if (port) {
+      const byPort = enabledControls.find(profile => Number(profile.port) === port)
+        || controls.find(profile => Number(profile.port) === port);
+      if (byPort) return byPort;
+    }
+
+    const modelKeys = modelControlKeys(model, runtimeModel);
+    if (!modelKeys.length) return null;
+
+    const byEnabledName = enabledControls.find(profile => {
+      const profileKeys = profileControlKeys(profile);
+      return modelKeys.some(modelKey => profileKeys.includes(modelKey));
+    });
+    if (byEnabledName) return byEnabledName;
+
+    return controls.find(profile => {
+      const profileKeys = profileControlKeys(profile);
+      return modelKeys.some(modelKey => profileKeys.includes(modelKey));
+    }) || null;
+  }
+
+  function actionState(profileId) {
+    return modelActions[profileId] || {};
+  }
+
+  function controlDisabledLabel(control) {
+    if (!control?.control_enabled) return 'Inventory Only';
+    return control?.status || 'Unavailable';
+  }
+
+  function isActiveControlStatus(status) {
+    return status === 'running' || status === 'loading' || status === 'starting';
+  }
+
+  function controlErrorMessage(state) {
+    if (!state?.error) return '';
+    if (state.code === 'busy') {
+      return 'Another model action is still finishing. Try again in a moment.';
+    }
+    if (state.code === 'FAILED_RAM_GUARD' || /available RAM dropped below/i.test(state.error)) {
+      return 'Start aborted: available RAM dropped below 10GB. Model was stopped automatically.';
+    }
+    return state.error;
+  }
+
+  function isDs4Model(model) {
+    return model?.source === 'ds4-dwarfstar' || model?.runtime === 'ds4';
+  }
+
+  function ds4StatusLabel(model) {
+    const status = model?.ds4Status || {};
+    if (status.running) return `RUNNING :${status.port || 8889}`;
+    if (status.port_listening) return `LOADING :${status.port || 8889}`;
+    return 'stopped';
+  }
+
+  function ds4MetaLine(model) {
+    const status = model?.ds4Status || {};
+    const mem = Number(status.mem_available_gb);
+    const nvrm = status.nvrm_delta;
+    return [
+      status.models_http_status ? `/v1/models ${status.models_http_status}` : null,
+      Number.isFinite(mem) ? `MemAvailable ${mem.toFixed(1)} GiB` : null,
+      Number.isFinite(Number(nvrm)) ? `NVRM delta ${nvrm}` : null,
+      status.localhost_only === false ? `bind ${status.listener_host || status.bind_scope || 'non-localhost'}` : null
+    ].filter(Boolean).join(' · ');
+  }
+
+  async function runDs4Action(action) {
+    ds4Action = { busy: true, verb: action };
+    try {
+      const endpoint = action === 'status' ? '/api/ds4/status' : `/api/ds4/${action}`;
+      const res = await fetch(endpoint, { method: action === 'status' ? 'GET' : 'POST' });
+      const data = await res.json();
+      if (!data.ok) throw Object.assign(new Error(data.message || `${action} failed`), { code: data.code });
+      const detail = action === 'status'
+        ? data.status
+        : (data.status || data.action || action);
+      ds4Action = { busy: false, message: detail, detail: data };
+    } catch (error) {
+      ds4Action = { busy: false, code: error.code, error: error.message || `${action} failed` };
+    }
+  }
+
+  async function refreshModelStatus(profileId) {
+    modelActions = { ...modelActions, [profileId]: { busy: true, verb: 'status' } };
+    try {
+      const res = await fetch(`/api/model-control/status/${profileId}`);
+      const data = await res.json();
+      if (!data.ok) throw Object.assign(new Error(data.message || 'Status failed'), { code: data.code });
+      modelControls = modelControls.map(profile => profile.profile_id === profileId ? { ...profile, ...data } : profile);
+      modelActions = { ...modelActions, [profileId]: { busy: false, message: data.status } };
+    } catch (error) {
+      modelActions = { ...modelActions, [profileId]: { busy: false, code: error.code, error: error.message || 'Status failed' } };
+    }
+  }
+
+  async function runModelAction(profileId, action) {
+    modelActions = { ...modelActions, [profileId]: { busy: true, verb: action } };
+    try {
+      const res = await fetch(`/api/model-control/${action}/${profileId}`, { method: 'POST' });
+      const data = await res.json();
+      if (!data.ok) throw Object.assign(new Error(data.message || `${action} failed`), { code: data.code });
+      modelActions = { ...modelActions, [profileId]: { busy: false, message: data.status || action } };
+      await loadModelControls();
+    } catch (error) {
+      modelActions = { ...modelActions, [profileId]: { busy: false, code: error.code, error: error.message || `${action} failed` } };
+      await loadModelControls();
+    }
+  }
 
   // Notes
   let editingNote = $state(null);
@@ -86,6 +325,207 @@
 
   function formatBytes(bytes) {
     return (bytes / (1024 ** 3)).toFixed(2);
+  }
+
+  function getModelStatusRank(model) {
+    const status = String(model?.status || '').toLowerCase();
+    if (model?.running || status === 'running') return 0;
+    if (status === 'loading' || status === 'starting') return 1;
+    if (status === 'stopped') return 2;
+    if (status === 'installed' || status === 'inventory' || status === 'inventory-only' || model?.inventoryOnly) return 3;
+    return 4;
+  }
+
+  function getModelPort(model) {
+    const port = Number(model?.port || model?.proxyPort || 0);
+    return Number.isFinite(port) && port > 0 ? port : Number.MAX_SAFE_INTEGER;
+  }
+
+  function getModelName(model) {
+    return String(model?.name || model?.model || model?.key || model?.id || '').toLowerCase();
+  }
+
+  function displayModelName(model) {
+    return model?.displayName || model?.modelName || model?.name || model?.key || model?.id || 'unknown model';
+  }
+
+  function displayModelId(model) {
+    return model?.apiModel || model?.servedModelName || model?.modelAlias || model?.name || model?.key || '';
+  }
+
+  function modelFunctionLabel(model, fallbackRuntime) {
+    if (model?.functionLabel) return model.functionLabel;
+    const runtime = String(model?.runtime || fallbackRuntime || '').toLowerCase();
+    if (runtime === 'llama' || runtime.includes('llama.cpp') || runtime.includes('llama-cpp')) return 'Plain GGUF · OpenAI-compatible API';
+    if (runtime === 'vllm') return 'vLLM OpenAI-compatible API';
+    return runtime ? `${runtime} API` : '';
+  }
+
+  function modelConnectionLabel(model, runtimeModel, fallbackPort) {
+    if (model?.connectionLabel) return model.connectionLabel;
+    const port = runtimeModel?.port || model?.port || fallbackPort;
+    const ctx = model?.ctx || runtimeModel?.ctxSize;
+    const ctxLabel = ctx ? `ctx ${(ctx / 1024).toFixed(0)}K` : '';
+    return [port ? `:${port}` : '', ctxLabel].filter(Boolean).join(' · ');
+  }
+
+  function sortModelsForDisplay(models) {
+    return [...(models || [])].sort((a, b) => {
+      const rankDiff = getModelStatusRank(a) - getModelStatusRank(b);
+      if (rankDiff !== 0) return rankDiff;
+      if (getModelStatusRank(a) === 0) {
+        const portDiff = getModelPort(a) - getModelPort(b);
+        if (portDiff !== 0) return portDiff;
+      }
+      return getModelName(a).localeCompare(getModelName(b));
+    });
+  }
+
+  function graphNodes(type) {
+    return (graphTopology?.nodes || []).filter(node => node.type === type);
+  }
+
+  function graphRuntimes() {
+    return graphNodes('runtime').sort((a, b) => Number(a.port || 0) - Number(b.port || 0));
+  }
+
+  function graphHealthNodes() {
+    return [...graphNodes('health'), ...graphNodes('network')];
+  }
+
+  function graphHealthPorts() {
+    return graphNodes('health_port').sort((a, b) => Number(a.port || 0) - Number(b.port || 0));
+  }
+
+  function graphNode(id) {
+    return (graphTopology?.nodes || []).find(node => node.id === id);
+  }
+
+  function graphStatusClass(status) {
+    const value = String(status || 'unknown').toLowerCase();
+    if (value === 'running') return 'running';
+    if (value === 'loading' || value === 'starting') return 'loading';
+    if (value === 'stopped') return 'stopped';
+    return 'unknown';
+  }
+
+  function graphRuntimeY(index) {
+    return 44 + (index * 44);
+  }
+
+  function compactGraphLabel(label, max = 28) {
+    const value = String(label || '');
+    return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+  }
+
+  function healthLatest() {
+    return dgxHealth?.latest || null;
+  }
+
+  function dgxHealthPorts() {
+    const snapshotPorts = Object.keys(healthLatest()?.listening_ports?.ports || {}).map(Number);
+    const topologyPorts = graphNodes('runtime').map(node => Number(node.port));
+    return [...new Set([...DGX_HEALTH_BASE_PORTS, ...snapshotPorts, ...topologyPorts])]
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+  }
+
+  function healthAgeSeconds() {
+    const value = Number(dgxHealth?.age_seconds);
+    return Number.isFinite(value) ? value : null;
+  }
+
+  function formatHealthAge(seconds) {
+    if (!Number.isFinite(seconds)) return 'unknown';
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remaining = seconds % 60;
+    return `${minutes}m ${remaining}s`;
+  }
+
+  function healthStatuses() {
+    const statuses = [...(healthLatest()?.status || [])];
+    const age = healthAgeSeconds();
+    if (Number.isFinite(age) && age > 180 && !statuses.includes('STALE_SNAPSHOT')) {
+      statuses.push('STALE_SNAPSHOT');
+    }
+    return statuses.length ? statuses : ['OK'];
+  }
+
+  function healthBadgeClass(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'ok') return 'running';
+    if (value.includes('emergency') || value.includes('block')) return 'stopped';
+    if (value.includes('warn') || value.includes('stale') || value.includes('gpu_memory')) return 'loading';
+    return 'unknown';
+  }
+
+  function memAvailableGiB() {
+    const value = Number(healthLatest()?.memory?.memavailable_gib);
+    return Number.isFinite(value) ? `${value.toFixed(1)} GiB` : 'unknown';
+  }
+
+  function defaultRoute() {
+    return healthLatest()?.routes?.default_route || {};
+  }
+
+  function activeOutputPath() {
+    const route = defaultRoute();
+    const dev = String(route.dev || '');
+    const raw = String(route.raw || '');
+    if (dev === 'enP7s7') return 'enP7s7 LAN';
+    if (dev === 'wlP9s9') return 'wlP9s9 Wi-Fi True/legacy';
+    if (dev.startsWith('tailscale')) return `${dev} Tailscale`;
+    if (raw.includes('192.168.5.1')) return 'Wi-Fi True/legacy';
+    if (dev) return `${dev} unknown`;
+    return 'unknown';
+  }
+
+  function healthInterfaces() {
+    return (healthLatest()?.interfaces?.classified || [])
+      .filter(iface => ['enP7s7', 'wlP9s9', 'tailscale0'].includes(iface.name))
+      .slice(0, 4);
+  }
+
+  function interfaceSummary(iface) {
+    return (iface?.addresses || [])
+      .map(item => `${item.address} ${item.classification}`)
+      .join(' / ');
+  }
+
+  function listeningCount(port) {
+    const rows = healthLatest()?.listening_ports?.ports?.[String(port)];
+    return Array.isArray(rows) ? rows.length : 0;
+  }
+
+  function endpointProbe(port) {
+    const key = Number(port) === 9000 ? 'dashboard_loopback' : String(port);
+    const entry = healthLatest()?.endpoint_health?.[key] || {};
+    return entry.models_endpoint || entry.probe || entry;
+  }
+
+  function endpointStatus(port) {
+    const probe = endpointProbe(port);
+    if (probe?.ok) return probe.http_code ? `OK ${probe.http_code}` : 'OK';
+    if (listeningCount(port) > 0) return 'listening';
+    return 'inactive';
+  }
+
+  function portClass(port) {
+    if (endpointProbe(port)?.ok || listeningCount(port) > 0) return 'running';
+    return 'unknown';
+  }
+
+  function healthMessages() {
+    const latest = healthLatest();
+    if (!latest) return [];
+    const messages = [];
+    if (healthStatuses().includes('STALE_SNAPSHOT')) messages.push('Snapshot is older than 180 seconds.');
+    if (latest.journal?.permission_limited) messages.push('Journal access is permission limited.');
+    if (latest.status?.includes('GPU_MEMORY_WARNING')) messages.push('Readable logs contain NVIDIA/NVRM/Xid memory warning evidence.');
+    if (latest.status?.includes('MODEL_INITIALIZING')) messages.push('Model process detected; its API is still initializing.');
+    if (messages.length === 0) messages.push('No dashboard-level health alerts beyond the recorded snapshot status.');
+    return messages;
   }
 </script>
 
@@ -182,8 +622,8 @@
         <div class="card stat-card">
           <div class="stat-top">
             <div class="stat-info" style="width:100%">
-              <h2>Disk</h2>
-              <div class="mem-total-compact">{disk.usedGB} / {disk.sizeGB} GB</div>
+              <h2>Storage</h2>
+              <div class="mem-total-compact">{disk.usedGB} / {disk.sizeGB} {disk.unit || 'GB'}</div>
             </div>
           </div>
           <div class="mem-bar-container">
@@ -193,23 +633,37 @@
           </div>
           <div class="mem-legend-compact">
             <span><span class="mem-dot disk"></span>Used {disk.usagePercent}%</span>
-            <span><span class="mem-dot free"></span>Free {disk.availableGB} GB</span>
+            <span><span class="mem-dot free"></span>Free {disk.availableGB} {disk.unit || 'GB'}</span>
           </div>
         </div>
       {/if}
 
       <!-- Network -->
       {#if metrics.network && metrics.network.length > 0}
-        {@const net = metrics.network.find(n => n.iface === 'all') || metrics.network[0]}
+        {@const net = selectGraphNetwork(metrics.network)}
+        {@const totalNet = metrics.network.find(n => n.iface === 'all') || net}
+        {@const networkRows = visibleNetworkRows(metrics.network)}
         <div class="card stat-card">
           <div class="stat-top">
             <div class="stat-info" style="width:100%">
               <h2>Network</h2>
               <div class="net-stats">
-                <span class="net-rx">↓ {net.rx_sec_mb.toFixed(2)} MB/s</span>
-                <span class="net-tx">↑ {net.tx_sec_mb.toFixed(2)} MB/s</span>
+                <span class="net-name">Total</span>
+                <span class="net-rx">↓ {formatNetworkSpeed(totalNet.rx_sec_mb)} MB/s</span>
+                <span class="net-tx">↑ {formatNetworkSpeed(totalNet.tx_sec_mb)} MB/s</span>
               </div>
             </div>
+          </div>
+          <div class="network-interfaces">
+            {#each networkRows as row}
+              <div class:network-active={row.iface === net.iface} class="network-interface" title={networkName(row)}>
+                <span class="net-name">{networkName(row)}</span>
+                <span class="net-flow">
+                  <span class="net-rx">↓ {formatNetworkSpeed(row.rx_sec_mb)}</span>
+                  <span class="net-tx">↑ {formatNetworkSpeed(row.tx_sec_mb)}</span>
+                </span>
+              </div>
+            {/each}
           </div>
           <div class="sparkline-container">
             <svg viewBox="0 0 120 28" preserveAspectRatio="none" class="sparkline">
@@ -222,37 +676,14 @@
       {/if}
     </div>
 
-    <!-- Row 2: Processes (compact) -->
-    {#if metrics.processes && metrics.processes.length > 0}
-      <div class="card processes-row">
-        <h2>Top Processes</h2>
-        <div class="processes-compact">
-          {#each metrics.processes.slice(0, 5) as process}
-            <div class="process-compact">
-              <div class="process-info">
-                <span class="process-name" title="{process.command}">
-                  {process.command.split(' ')[0].split('/').pop()}
-                </span>
-                <span class="process-user-compact">{process.user}</span>
-              </div>
-              <div class="process-stats">
-                <span class="process-mem-compact">{process.memoryGB} GB</span>
-                <span class="process-cpu-compact">{process.cpu}%</span>
-              </div>
-            </div>
-          {/each}
-        </div>
-      </div>
-    {/if}
-
-    <!-- Row 3: All Models side by side -->
+    <!-- Row 2: All Models side by side -->
     {#if metrics.inference}
       <div class="models-row">
         <!-- llama.cpp -->
         <div class="card models-card">
           <h2>llama.cpp
             {#if metrics.inference.llama.status === 'running'}
-              <span class="engine-status running">● :{metrics.inference.llama.proxyPort}</span>
+              <span class="engine-status running">● Ready to Use (:{metrics.inference.llama.proxyPort})</span>
             {:else if metrics.inference.llama.status === 'loading'}
               <span class="engine-status loading">◐ loading :{metrics.inference.llama.port}</span>
             {:else}
@@ -260,14 +691,27 @@
             {/if}
           </h2>
           <div class="models-list">
-            {#if metrics.inference.availableModels?.llama}
-              {#each metrics.inference.availableModels.llama as model}
-                {@const isRunning = metrics.inference.llama.status !== 'stopped' && (metrics.inference.llama.model === model.key || (metrics.inference.llama.model && model.name && metrics.inference.llama.model.includes(model.name.split('-00')[0])))}
-                {@const noteId = `llama:${model.key}`}
+	            {#if metrics.inference.availableModels?.llama}
+	              {#each sortModelsForDisplay(metrics.inference.availableModels.llama) as model}
+	                {@const runtimeModel = metrics.inference.llama.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias)) || model}
+	                {@const isRunning = runtimeModel ? (runtimeModel.status === 'running' || runtimeModel.status === 'loading') : (model.status ? (model.status === 'running' || model.status === 'loading') : false)}
+	                {@const displayPort = runtimeModel?.port || model.port || metrics.inference.llama.port}
+                  {@const control = controlForModel(model, runtimeModel, displayPort)}
+                  {@const controlState = control ? actionState(control.profile_id) : {}}
+	                {@const noteId = `llama:${model.key || model.name}`}
                 <div class="model-item {isRunning ? 'loaded' : ''}">
                   <div class="model-header-row">
-                    <div class="model-name">{model.name || model.key}</div>
-                    {#if isRunning}<span class="running-badge">{metrics.inference.llama.status === 'loading' ? 'LOADING' : 'RUNNING'}</span>{/if}
+                    <div class="model-title-wrap">
+                      <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
+                      {#if displayModelId(model) && displayModelId(model) !== displayModelName(model)}
+                        <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
+                      {/if}
+                    </div>
+	                    {#if isRunning}<span class="running-badge">{(runtimeModel?.status || model.status || metrics.inference.llama.status) === 'running' ? 'Ready to Use' : 'Loading'}{#if displayPort} (:{displayPort}){/if}</span>{/if}
+                  </div>
+                  <div class="model-function">
+                    {#if modelFunctionLabel(model, 'llama')}<span>{modelFunctionLabel(model, 'llama')}</span>{/if}
+                    {#if modelConnectionLabel(model, runtimeModel, displayPort)}<span>{modelConnectionLabel(model, runtimeModel, displayPort)}</span>{/if}
                   </div>
                   <div class="model-info">
                     {#if model.sizeGB}<span class="model-size">{model.sizeGB} GB</span>{/if}
@@ -276,6 +720,22 @@
                     {#if model.ctx}<span class="model-params">ctx: {(model.ctx / 1024).toFixed(0)}K</span>{/if}
                     {#if isRunning && metrics.inference.llama.ctxSize}<span class="model-params active-ctx">active: {(metrics.inference.llama.ctxSize / 1024).toFixed(0)}K</span>{/if}
                   </div>
+                  {#if control}
+                    <div class="model-control">
+                      <button class="control-btn secondary" disabled={(controlState.busy && controlState.verb === 'status') || !control.control_enabled} onclick={() => refreshModelStatus(control.profile_id)}>Status</button>
+                      {#if !control.control_enabled}
+                        <button class="control-btn secondary" disabled>{controlDisabledLabel(control)}</button>
+                      {:else if isActiveControlStatus(control.status)}
+                        <button class="control-btn stop" disabled={controlState.busy} onclick={() => runModelAction(control.profile_id, 'stop')}>{controlState.busy && controlState.verb === 'stop' ? 'Stopping' : 'Stop Model'}</button>
+                      {:else if control.status === 'stopped'}
+                        <button class="control-btn start" disabled={controlState.busy} onclick={() => runModelAction(control.profile_id, 'start')}>{controlState.busy && controlState.verb === 'start' ? 'Starting' : 'Start Model'}</button>
+                      {:else}
+                        <button class="control-btn secondary" disabled>{control.status || 'loading'}</button>
+                      {/if}
+                    </div>
+                    {#if controlState.message}<div class="control-message">{controlState.message}</div>{/if}
+                    {#if controlState.error}<div class="control-error">{controlErrorMessage(controlState)}</div>{/if}
+                  {/if}
                   {#if editingNote === noteId}
                     <div class="note-edit">
                       <textarea bind:value={noteInput} placeholder="Add note..." rows="2" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveNote(noteId); } if (e.key === 'Escape') cancelEdit(); }}></textarea>
@@ -309,18 +769,47 @@
           </h2>
           <div class="models-list">
             {#if metrics.inference.availableModels?.vllm && metrics.inference.availableModels.vllm.length > 0}
-              {#each metrics.inference.availableModels.vllm as model}
-                {@const isRunning = metrics.inference.vllm.status !== 'stopped' && metrics.inference.vllm.model && model.name.includes(metrics.inference.vllm.model)}
+              {#each sortModelsForDisplay(metrics.inference.availableModels.vllm) as model}
+                {@const runtimeModel = metrics.inference.vllm.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias))}
+                {@const isRunning = runtimeModel ? (runtimeModel.status === 'running' || runtimeModel.status === 'loading') : (model.status ? (model.status === 'running' || model.status === 'loading') : (metrics.inference.vllm.status !== 'stopped' && metrics.inference.vllm.model && model.name.includes(metrics.inference.vllm.model)))}
+                {@const displayPort = runtimeModel?.port || model.port}
+                {@const control = controlForModel(model, runtimeModel, displayPort)}
+                {@const controlState = control ? actionState(control.profile_id) : {}}
                 {@const noteId = `vllm:${model.name}`}
                 <div class="model-item {isRunning ? 'loaded' : ''}">
                   <div class="model-header-row">
-                    <div class="model-name">{model.name.split('/').pop()}</div>
-                    {#if isRunning}<span class="running-badge">{metrics.inference.vllm.status === 'running' ? 'RUNNING' : 'LOADING'}</span>{/if}
+                    <div class="model-title-wrap">
+                      <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
+                      {#if displayModelId(model) && displayModelId(model) !== displayModelName(model)}
+                        <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
+                      {/if}
+                    </div>
+                    {#if isRunning}<span class="running-badge">{(runtimeModel?.status || model.status || metrics.inference.vllm.status) === 'running' ? 'RUNNING' : 'LOADING'}{#if displayPort} :{displayPort}{/if}</span>{/if}
+                  </div>
+                  <div class="model-function">
+                    {#if modelFunctionLabel(model, 'vllm')}<span>{modelFunctionLabel(model, 'vllm')}</span>{/if}
+                    {#if modelConnectionLabel(model, runtimeModel, displayPort)}<span>{modelConnectionLabel(model, runtimeModel, displayPort)}</span>{/if}
                   </div>
                   <div class="model-info">
                     <span class="model-size">{model.sizeGB} GB</span>
-                    <span class="model-params">{model.name.split('/')[0]}</span>
+                    <span class="model-params">{model.name?.split('/')?.[0]}</span>
                   </div>
+                  {#if control}
+                    <div class="model-control">
+                      <button class="control-btn secondary" disabled={(controlState.busy && controlState.verb === 'status') || !control.control_enabled} onclick={() => refreshModelStatus(control.profile_id)}>Status</button>
+                      {#if !control.control_enabled}
+                        <button class="control-btn secondary" disabled>{controlDisabledLabel(control)}</button>
+                      {:else if isActiveControlStatus(control.status)}
+                        <button class="control-btn stop" disabled={controlState.busy} onclick={() => runModelAction(control.profile_id, 'stop')}>{controlState.busy && controlState.verb === 'stop' ? 'Stopping' : 'Stop Model'}</button>
+                      {:else if control.status === 'stopped'}
+                        <button class="control-btn start" disabled={controlState.busy} onclick={() => runModelAction(control.profile_id, 'start')}>{controlState.busy && controlState.verb === 'start' ? 'Starting' : 'Start Model'}</button>
+                      {:else}
+                        <button class="control-btn secondary" disabled>{control.status || 'loading'}</button>
+                      {/if}
+                    </div>
+                    {#if controlState.message}<div class="control-message">{controlState.message}</div>{/if}
+                    {#if controlState.error}<div class="control-error">{controlErrorMessage(controlState)}</div>{/if}
+                  {/if}
                   {#if editingNote === noteId}
                     <div class="note-edit">
                       <textarea bind:value={noteInput} placeholder="Add note..." rows="2" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveNote(noteId); } if (e.key === 'Escape') cancelEdit(); }}></textarea>
@@ -343,26 +832,55 @@
           </div>
         </div>
 
-        <!-- Ollama -->
+        <!-- ETC -->
         {#if metrics.inference.ollama}
           <div class="card models-card">
-            <h2>Ollama {#if metrics.inference.ollama.available}<span class="engine-status running">● :{metrics.inference.ollama.port}</span>{:else}<span class="engine-status stopped">○ stopped</span>{/if}</h2>
+            <h2>ETC</h2>
             <div class="models-list">
+              <HermesSpotlight />
               {#if metrics.inference.ollama.models && metrics.inference.ollama.models.length > 0}
-                {#each metrics.inference.ollama.models as model}
-                  {@const isRunning = metrics.inference.ollama.runningModel === model.name}
+                {#each sortModelsForDisplay(metrics.inference.ollama.models.map(model => ({ ...model, status: metrics.inference.ollama.runningModel === model.name ? 'running' : (model.status || 'installed') }))) as model}
+                  {@const runtimeModel = isDs4Model(model) ? null : metrics.inference.vllm.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias))}
+                  {@const isRunning = isDs4Model(model) ? Boolean(model.ds4Status?.running) : (runtimeModel ? (runtimeModel.status === 'running' || runtimeModel.status === 'loading') : (model.status ? (model.status === 'running' || model.status === 'loading') : false))}
                   {@const noteId = `ollama:${model.name}`}
                   <div class="model-item {isRunning ? 'loaded' : ''}">
-                    <div class="model-header-row">
-                      <div class="model-name">{model.name}</div>
-                      {#if isRunning}<span class="running-badge">LOADED</span>{/if}
+                  <div class="model-header-row">
+                    <div class="model-title-wrap">
+                      <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
+                      {#if displayModelId(model) && displayModelId(model) !== displayModelName(model)}
+                        <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
+                      {/if}
+                    </div>
+                      {#if isDs4Model(model)}
+                        <span class="running-badge {model.ds4Status?.running ? '' : 'stopped-badge'}">{ds4StatusLabel(model)}</span>
+                      {:else if isRunning}
+                        <span class="running-badge">{(runtimeModel?.status || model.status || metrics.inference.vllm.status) === 'running' ? 'RUNNING' : 'LOADING'}</span>
+                      {/if}
+                    </div>
+                    <div class="model-function">
+                      <span>{isDs4Model(model) ? 'ds4-server / DwarfStar' : 'Ollama API'}</span>
+                      {#if modelConnectionLabel(model, runtimeModel, metrics.inference.ollama.port)}<span>{modelConnectionLabel(model, runtimeModel, metrics.inference.ollama.port)}</span>{/if}
                     </div>
                     <div class="model-info">
                       {#if model.sizeGB}<span class="model-size">{model.sizeGB} GB</span>{/if}
                       {#if model.quantFormat}<span class="model-quant">{model.quantFormat}</span>{/if}
                       {#if model.paramSize}<span class="model-params">{model.paramSize}</span>{/if}
                       {#if model.family}<span class="model-params">{model.family}</span>{/if}
+                      {#if isDs4Model(model) && model.ctx}<span class="model-params">ctx: {(model.ctx / 1024).toFixed(0)}K</span>{/if}
                     </div>
+                    {#if isDs4Model(model)}
+                      <div class="model-control">
+                        <button class="control-btn secondary" disabled={ds4Action.busy && ds4Action.verb === 'status'} onclick={() => runDs4Action('status')}>Status</button>
+                        {#if model.ds4Status?.running}
+                          <button class="control-btn stop" disabled={ds4Action.busy} onclick={() => runDs4Action('stop')}>{ds4Action.busy && ds4Action.verb === 'stop' ? 'Stopping' : 'Stop Model'}</button>
+                        {:else}
+                          <button class="control-btn start" disabled={ds4Action.busy} onclick={() => runDs4Action('start')}>{ds4Action.busy && ds4Action.verb === 'start' ? 'Starting' : 'Start Model'}</button>
+                        {/if}
+                      </div>
+                      {#if ds4MetaLine(model)}<div class="control-message">{ds4MetaLine(model)}</div>{/if}
+                      {#if ds4Action.message}<div class="control-message">{ds4Action.message}</div>{/if}
+                      {#if ds4Action.error}<div class="control-error">{controlErrorMessage(ds4Action)}</div>{/if}
+                    {/if}
                     {#if editingNote === noteId}
                       <div class="note-edit">
                         <textarea bind:value={noteInput} placeholder="Add note..." rows="2" onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveNote(noteId); } if (e.key === 'Escape') cancelEdit(); }}></textarea>
@@ -387,6 +905,272 @@
         {/if}
       </div>
     {/if}
+
+    <div class="card dgx-health-card">
+      <div class="dgx-health-header">
+        <h2>DGX Health <span class="engine-status {dgxHealth?.ok ? 'running' : 'loading'}">{dgxHealth?.ok ? 'snapshot' : 'unavailable'}</span></h2>
+        <span class="health-path">~/dgx-health/logs/latest.json</span>
+      </div>
+
+      {#if dgxHealthError}
+        <div class="control-error">{dgxHealthError}</div>
+      {/if}
+
+      {#if dgxHealth?.ok && healthLatest()}
+        {@const latest = healthLatest()}
+        <div class="health-badges">
+          {#each healthStatuses() as status}
+            <span class="health-badge {healthBadgeClass(status)}">{status}</span>
+          {/each}
+        </div>
+
+        <div class="health-grid">
+          <div class="health-section">
+            <div class="health-section-title">Snapshot</div>
+            <div class="health-row"><span>Timestamp</span><strong>{latest.timestamp || 'unknown'}</strong></div>
+            <div class="health-row"><span>Age</span><strong>{formatHealthAge(healthAgeSeconds())}</strong></div>
+            <div class="health-row"><span>Boot</span><strong>{latest.boot_id?.slice(0, 8) || 'unknown'}</strong></div>
+            <div class="health-row"><span>Host</span><strong>{latest.hostname || 'unknown'}</strong></div>
+          </div>
+
+          <div class="health-section">
+            <div class="health-section-title">Resources</div>
+            <div class="health-row"><span>MemAvailable</span><strong>{memAvailableGiB()}</strong></div>
+            <div class="health-row"><span>Swap</span><strong>{latest.memory?.swapon?.ok ? 'recorded' : 'unknown'}</strong></div>
+            <div class="health-row"><span>Load</span><strong>{(latest.load_average || []).join(' ') || 'unknown'}</strong></div>
+            <div class="health-row"><span>Disk</span><strong>{latest.disk?.root?.use_percent || latest.disk?.root?.used || 'recorded'}</strong></div>
+          </div>
+
+          <div class="health-section">
+            <div class="health-section-title">Network</div>
+            <div class="health-row"><span>Output</span><strong>{activeOutputPath()}</strong></div>
+            <div class="health-row"><span>Default</span><strong>{defaultRoute().via || 'unknown'} {defaultRoute().dev || ''}</strong></div>
+            <div class="health-row"><span>Source</span><strong>{defaultRoute().src || 'unknown'}</strong></div>
+            <div class="health-row"><span>Metric</span><strong>{defaultRoute().metric || 'unknown'}</strong></div>
+          </div>
+        </div>
+
+        <div class="health-subgrid">
+          <div class="health-section">
+            <div class="health-section-title">Interfaces</div>
+            <div class="interface-grid">
+              {#each healthInterfaces() as iface}
+                <div class="health-chip" title={interfaceSummary(iface)}>
+                  <span>{iface.name}</span>
+                  <strong>{iface.state}</strong>
+                </div>
+              {/each}
+            </div>
+          </div>
+
+          <div class="health-section">
+            <div class="health-section-title">Ports / Endpoints</div>
+            <div class="port-grid">
+              {#each dgxHealthPorts() as port}
+                <div class="port-pill {portClass(port)}">
+                  <span>:{port}</span>
+                  <strong>{endpointStatus(port)}</strong>
+                </div>
+              {/each}
+            </div>
+          </div>
+        </div>
+
+        <div class="health-message-list">
+          {#each healthMessages() as message}
+            <span>{message}</span>
+          {/each}
+        </div>
+      {:else}
+        <div class="graphify-empty">Health snapshot unavailable.</div>
+      {/if}
+    </div>
+
+    <div class="card graphify-card">
+      <div class="graphify-header">
+        <h2>Graphify <span class="engine-status {graphTopology ? 'running' : 'loading'}">{graphTopology ? `${graphTopology.nodes?.length || 0} nodes` : 'loading'}</span></h2>
+        <button class="control-btn secondary" onclick={loadGraphifyTopology}>Refresh</button>
+      </div>
+
+      {#if graphifyError}
+        <div class="control-error">{graphifyError}</div>
+      {/if}
+
+      {#if graphTopology}
+        <div class="graphify-canvas-wrap">
+          <svg class="graphify-canvas" viewBox="0 0 820 340" role="img" aria-label="DGX runtime topology">
+            <defs>
+              <marker id="graph-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                <path d="M0,0 L8,4 L0,8 Z" fill="#4f6f43" />
+              </marker>
+            </defs>
+
+            <line x1="120" y1="78" x2="280" y2="78" class="graph-edge-line" marker-end="url(#graph-arrow)" />
+            <line x1="120" y1="162" x2="280" y2="162" class="graph-edge-line" marker-end="url(#graph-arrow)" />
+            <line x1="365" y1="78" x2="365" y2="162" class="graph-edge-line" marker-end="url(#graph-arrow)" />
+            <line x1="365" y1="162" x2="500" y2="162" class="graph-edge-line" marker-end="url(#graph-arrow)" />
+
+            <g class="graph-svg-node">
+              <rect x="24" y="42" width="120" height="72" rx="8" />
+              <text x="84" y="70" text-anchor="middle">Access</text>
+              <text x="84" y="92" text-anchor="middle" class="graph-svg-sub">Local / LAN / Tail</text>
+            </g>
+
+            <g class="graph-svg-node">
+              <rect x="24" y="126" width="120" height="72" rx="8" />
+              <text x="84" y="154" text-anchor="middle">Clients</text>
+              <text x="84" y="176" text-anchor="middle" class="graph-svg-sub">Cline / CCR</text>
+            </g>
+
+            <g class="graph-svg-node running">
+              <rect x="280" y="42" width="170" height="72" rx="8" />
+              <text x="365" y="70" text-anchor="middle">Main Dashboard :9000</text>
+              <text x="365" y="92" text-anchor="middle" class="graph-svg-sub">{graphTopology.host}</text>
+            </g>
+
+            <g class="graph-svg-node running">
+              <rect x="280" y="126" width="170" height="72" rx="8" />
+              <text x="365" y="154" text-anchor="middle">DGX Host</text>
+              <text x="365" y="176" text-anchor="middle" class="graph-svg-sub">edgexpert-ba03</text>
+            </g>
+
+            <g class="graph-svg-node">
+              <rect x="280" y="226" width="170" height="72" rx="8" />
+              <text x="365" y="254" text-anchor="middle">Model Control</text>
+              <text x="365" y="276" text-anchor="middle" class="graph-svg-sub">{graphNodes('profile').length} profiles</text>
+            </g>
+
+            {#each graphRuntimes().slice(0, 6) as node, index}
+              <line x1="500" y1="162" x2="570" y2={graphRuntimeY(index)} class="graph-edge-line faint" marker-end="url(#graph-arrow)" />
+              <g class="graph-svg-node {graphStatusClass(node.status)}">
+                <rect x="570" y={graphRuntimeY(index) - 22} width="220" height="38" rx="7" />
+                <text x="582" y={graphRuntimeY(index) - 5}>{compactGraphLabel(node.label)}</text>
+                <text x="582" y={graphRuntimeY(index) + 10} class="graph-svg-sub">:{node.port} · {node.runtime}{#if node.contextLabel} · {node.contextLabel}{/if}</text>
+              </g>
+            {/each}
+          </svg>
+        </div>
+
+        <div class="graphify-lanes">
+          <div class="graph-lane">
+            <div class="graph-lane-title">Access Paths</div>
+            {#each graphNodes('access') as node}
+              <div class="graph-chip {graphStatusClass(node.status)}">
+                <span class="graph-dot"></span>
+                <span>{node.label}</span>
+              </div>
+            {/each}
+          </div>
+
+          <div class="graph-lane">
+            <div class="graph-lane-title">Clients / Tools</div>
+            {#each graphNodes('client') as node}
+              <div class="graph-chip {graphStatusClass(node.status)}">
+                <span class="graph-dot"></span>
+                <span>{node.label}</span>
+              </div>
+            {/each}
+          </div>
+
+          <div class="graph-lane">
+            <div class="graph-lane-title">Health / Route</div>
+            {#each graphHealthNodes() as node}
+              <div class="graph-chip {graphStatusClass(node.status)}">
+                <span class="graph-dot"></span>
+                <span>{node.label}</span>
+                {#if node.ageSeconds !== undefined && node.ageSeconds !== null}
+                  <strong>{node.ageSeconds}s</strong>
+                {:else if node.labelDetail}
+                  <strong>{node.labelDetail}</strong>
+                {/if}
+              </div>
+            {/each}
+          </div>
+
+          <div class="graph-lane">
+            <div class="graph-lane-title">Observed Ports</div>
+            <div class="graph-port-list">
+              {#each graphHealthPorts() as node}
+                <div class="graph-chip {graphStatusClass(node.status)}">
+                  <span class="graph-dot"></span>
+                  <span>:{node.port}</span>
+                  <strong>{node.status}</strong>
+                </div>
+              {/each}
+            </div>
+          </div>
+
+          <div class="graph-lane runtime-lane">
+            <div class="graph-lane-title">Model Runtimes</div>
+            <div class="graph-runtime-grid">
+              {#each graphRuntimes() as node}
+                <div class="graph-runtime-node {graphStatusClass(node.status)}">
+                  <div class="graph-runtime-top">
+                    <span class="graph-dot"></span>
+                    <span class="graph-runtime-name" title={node.label}>{node.label}</span>
+                    <span class="graph-port">:{node.port}</span>
+                  </div>
+                  <div class="graph-runtime-meta">
+                    <span>{node.runtime}</span>
+                    {#if node.contextLabel}<span>ctx {node.contextLabel}</span>{/if}
+                    {#if node.validatedInput}<span>input {node.validatedInput}</span>{/if}
+                    {#if node.recommendedOutput}<span>recommended output {node.recommendedOutput}</span>{/if}
+                    {#if node.validatedOutput}<span>output {node.validatedOutput}</span>{/if}
+                    {#if node.maxNumSeqs}<span>seq {node.maxNumSeqs}</span>{/if}
+                    {#if node.maxNumBatchedTokens}<span>batch {node.maxNumBatchedTokens}</span>{/if}
+                    {#if node.gpuMemoryUtilization}<span>GPU util {node.gpuMemoryUtilization}</span>{/if}
+                    {#if node.moeBackend}<span>MoE {node.moeBackend}</span>{/if}
+                    {#if node.linearBackend}<span>linear {node.linearBackend}</span>{/if}
+                    {#if node.cuteDslArch}<span>{node.cuteDslArch}</span>{/if}
+                    {#if node.thinkingDefault}<span>thinking default ON</span>{/if}
+                    {#if node.mtpOptionalTokens}<span>MTP OFF / optional {node.mtpOptionalTokens}</span>{/if}
+                    {#if node.startupSafetyStatus}<span>{node.startupSafetyStatus}</span>{/if}
+                    {#if node.speculative}<span>{node.speculativeType || 'speculative'}</span>{/if}
+                    {#if node.isLora}<span>LoRA</span>{/if}
+                    {#if node.profileId}<span>{node.profileId}</span>{/if}
+                  </div>
+                  {#if node.modelId}
+                    <div class="graph-runtime-model" title={node.modelId}>{node.modelId}</div>
+                  {/if}
+                  {#if node.modelRepository}
+                    <div class="graph-runtime-model" title={`${node.modelRepository}@${node.modelRevision || 'revision unknown'}`}>{node.modelRepository}@{node.modelRevision || 'revision unknown'}</div>
+                  {/if}
+                  {#if node.runtimeStack}
+                    <div class="graph-runtime-model" title={node.runtimeStack}>{node.runtimeStack}</div>
+                  {/if}
+                  {#if node.loraPath}
+                    <div class="graph-runtime-model" title={node.loraPath}>LoRA: {node.loraPath}</div>
+                  {/if}
+                  {#if node.startupSafetyStatus}
+                    <div class="graph-runtime-model" title={node.safetyEvidence}>
+                      startup NVRM {node.startupNvrmCount ?? 'pending'} · post-ready {node.postReadyNvrmDelta ?? 'pending'} · zero-certified {node.zeroNvrmCertified ? 'yes' : 'no'}
+                    </div>
+                  {/if}
+                  {#if node.kvDtype || node.attentionBackend || node.moeBackend || node.executorBackend}
+                    <div class="graph-runtime-model">
+                      {node.kvDtype || 'KV ?'} · {node.attentionBackend || 'attention ?'} · {node.moeBackend || 'MoE ?'} · {node.executorBackend || 'executor ?'}
+                    </div>
+                  {/if}
+                  {#if node.tailscaleEndpoint}
+                    <div class="graph-runtime-model" title={node.tailscaleEndpoint}>{node.tailscaleEndpoint}</div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          </div>
+        </div>
+
+        <div class="graph-edge-list">
+          {#each (graphTopology.edges || []).filter(edge => edge.source === 'dashboard:9000' || edge.source === 'control:modelctl' || edge.source === 'client:claude-code-router').slice(0, 14) as edge}
+            {@const from = graphNode(edge.source)}
+            {@const to = graphNode(edge.target)}
+            <span>{from?.label || edge.source} → {to?.label || edge.target} · {edge.label}</span>
+          {/each}
+        </div>
+      {:else}
+        <div class="graphify-empty">Topology loading...</div>
+      {/if}
+    </div>
 
     <div class="footer-compact">
       {new Date(metrics.timestamp).toLocaleTimeString()}
@@ -539,72 +1323,59 @@
   .net-stats {
     display: flex;
     gap: 0.75rem;
-    font-size: 0.8rem;
+    font-size: 0.68rem;
+    font-weight: 600;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .network-interfaces {
+    display: grid;
+    gap: 0.25rem;
+    margin-top: 0.45rem;
+  }
+  .network-interface {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    align-items: center;
+    min-height: 1.35rem;
+    padding: 0.18rem 0.35rem;
+    background: #111;
+    border: 1px solid #242424;
+    border-radius: 4px;
+    font-size: 0.58rem;
+  }
+  .network-interface.network-active {
+    border-color: rgba(0, 212, 255, 0.45);
+    background: rgba(0, 212, 255, 0.06);
+  }
+  .net-name {
+    color: #cfcfcf;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .net-flow {
+    display: flex;
+    gap: 0.45rem;
+    white-space: nowrap;
     font-weight: 600;
   }
   .net-rx { color: #00d4ff; }
   .net-tx { color: #76b900; }
 
-  /* Processes row */
-  .processes-row {
-    margin-bottom: 0.5rem;
-  }
-
-  .processes-row h2 { text-align: left; }
-
-  .processes-compact {
-    display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 0.3rem;
-    width: 100%;
-  }
-
-  .process-compact {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 0.25rem 0.4rem;
-    background: #0f0f0f;
-    border-radius: 4px;
-    font-size: 0.65rem;
-  }
-
-  .process-info {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .process-name {
-    color: #fff;
-    font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    font-family: 'Monaco', 'Menlo', monospace;
-  }
-
-  .process-user-compact { color: #00d4ff; font-size: 0.6rem; }
-
-  .process-stats {
-    display: flex;
-    gap: 0.4rem;
-    flex-shrink: 0;
-    font-size: 0.65rem;
-  }
-  .process-mem-compact { color: #76b900; font-weight: 600; }
-  .process-cpu-compact { color: #ff9800; }
-
   /* Models row */
   .models-row {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: minmax(0, 26fr) minmax(0, 34fr) minmax(0, 40fr);
     gap: 0.5rem;
     margin-bottom: 0.5rem;
   }
 
   .models-card {
     min-height: 0;
-    max-height: 450px;
+    max-height: 520px;
     text-align: left;
     overflow: hidden;
     display: flex;
@@ -657,7 +1428,13 @@
   .model-header-row {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: flex-start;
+    gap: 0.45rem;
+  }
+
+  .model-title-wrap {
+    min-width: 0;
+    flex: 1;
   }
 
   .model-name {
@@ -665,9 +1442,35 @@
     font-weight: 600;
     font-size: 0.8rem;
     font-family: 'Monaco', 'Menlo', monospace;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.25;
+  }
+
+  .model-id {
+    color: #777;
+    font-size: 0.58rem;
+    font-family: 'Monaco', 'Menlo', monospace;
+    line-height: 1.25;
+    margin-top: 0.12rem;
+    overflow-wrap: anywhere;
+  }
+
+  .model-function {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.25rem;
+  }
+
+  .model-function span {
+    color: #c9d4c0;
+    background: rgba(118, 185, 0, 0.1);
+    border: 1px solid rgba(118, 185, 0, 0.22);
+    border-radius: 3px;
+    padding: 0.08rem 0.28rem;
+    font-size: 0.58rem;
+    line-height: 1.3;
   }
 
   .running-badge {
@@ -679,6 +1482,11 @@
     border-radius: 3px;
     letter-spacing: 0.5px;
     flex-shrink: 0;
+  }
+
+  .running-badge.stopped-badge {
+    color: #ff6b6b;
+    background: #4d1a1a;
   }
 
   .model-info {
@@ -701,6 +1509,42 @@
 
   .model-params { color: #888; }
   .model-params.active-ctx { color: #76b900; font-weight: 600; }
+
+  .model-control {
+    display: flex;
+    gap: 0.3rem;
+    margin-top: 0.3rem;
+    flex-wrap: wrap;
+  }
+
+  .control-btn {
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 0.2rem 0.45rem;
+    font-size: 0.65rem;
+    font-weight: 700;
+    cursor: pointer;
+    color: #eee;
+    background: #222;
+  }
+  .control-btn:hover:not(:disabled) { border-color: #76b900; }
+  .control-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+  .control-btn.start { background: #1a4d1a; color: #76b900; }
+  .control-btn.stop { background: #4d1a1a; color: #ff6b6b; }
+  .control-btn.secondary { background: #1a1a1a; color: #aaa; }
+
+  .control-message {
+    color: #76b900;
+    font-size: 0.65rem;
+    margin-top: 0.2rem;
+  }
+
+  .control-error {
+    color: #ff6b6b;
+    font-size: 0.65rem;
+    margin-top: 0.2rem;
+    line-height: 1.3;
+  }
 
   /* Notes */
   .note-display {
@@ -734,6 +1578,443 @@
   .note-btn.save { background: #76b900; color: #000; }
   .note-btn.cancel { background: #444; color: #ccc; }
 
+  .dgx-health-card {
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+  }
+
+  .dgx-health-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.45rem;
+  }
+
+  .dgx-health-header h2 {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .health-path {
+    color: #777;
+    font-size: 0.62rem;
+    font-family: 'Monaco', 'Menlo', monospace;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
+
+  .health-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .health-badge {
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 0.16rem 0.42rem;
+    font-size: 0.58rem;
+    font-weight: 800;
+    letter-spacing: 0.4px;
+    color: #aaa;
+    background: #111;
+  }
+
+  .health-badge.running {
+    color: #76b900;
+    border-color: rgba(118, 185, 0, 0.45);
+    background: rgba(118, 185, 0, 0.12);
+  }
+
+  .health-badge.loading {
+    color: #ffd166;
+    border-color: rgba(255, 209, 102, 0.45);
+    background: rgba(255, 209, 102, 0.1);
+  }
+
+  .health-badge.stopped {
+    color: #ff6b6b;
+    border-color: rgba(255, 107, 107, 0.45);
+    background: rgba(255, 107, 107, 0.1);
+  }
+
+  .health-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.5rem;
+  }
+
+  .health-subgrid {
+    display: grid;
+    grid-template-columns: 1fr 2fr;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .health-section {
+    background: #0f0f0f;
+    border: 1px solid #242424;
+    border-radius: 6px;
+    padding: 0.45rem;
+    min-width: 0;
+  }
+
+  .health-section-title {
+    color: #c9d4c0;
+    font-size: 0.6rem;
+    font-weight: 800;
+    letter-spacing: 0.45px;
+    text-transform: uppercase;
+    margin-bottom: 0.35rem;
+  }
+
+  .health-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.5rem;
+    min-height: 1.15rem;
+    color: #858585;
+    font-size: 0.64rem;
+  }
+
+  .health-row strong {
+    color: #ededed;
+    font-size: 0.66rem;
+    font-weight: 700;
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+
+  .interface-grid,
+  .port-grid {
+    display: grid;
+    gap: 0.35rem;
+  }
+
+  .interface-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .port-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .health-chip,
+  .port-pill {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.35rem;
+    align-items: center;
+    background: #151515;
+    border: 1px solid #2a2a2a;
+    border-radius: 4px;
+    padding: 0.25rem 0.35rem;
+    min-width: 0;
+    font-size: 0.62rem;
+  }
+
+  .health-chip span,
+  .port-pill span {
+    color: #cfcfcf;
+    font-family: 'Monaco', 'Menlo', monospace;
+  }
+
+  .health-chip strong,
+  .port-pill strong {
+    color: #888;
+    font-size: 0.58rem;
+    overflow-wrap: anywhere;
+    text-align: right;
+  }
+
+  .port-pill.running {
+    border-color: rgba(118, 185, 0, 0.42);
+    background: rgba(118, 185, 0, 0.08);
+  }
+
+  .port-pill.running strong { color: #76b900; }
+
+  .health-message-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+  }
+
+  .health-message-list span {
+    color: #cfcfcf;
+    background: #111;
+    border: 1px solid #242424;
+    border-radius: 4px;
+    padding: 0.25rem 0.4rem;
+    font-size: 0.62rem;
+    line-height: 1.3;
+  }
+
+  .graphify-card {
+    margin-bottom: 0.5rem;
+    overflow: hidden;
+  }
+
+  .graphify-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.45rem;
+  }
+
+  .graphify-header h2 {
+    margin: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .graphify-canvas-wrap {
+    width: 100%;
+    overflow-x: auto;
+    background: #0f0f0f;
+    border: 1px solid #242424;
+    border-radius: 6px;
+  }
+
+  .graphify-canvas {
+    width: 100%;
+    min-width: 820px;
+    height: 340px;
+    display: block;
+  }
+
+  .graph-edge-line {
+    stroke: #4f6f43;
+    stroke-width: 1.3;
+    fill: none;
+  }
+
+  .graph-edge-line.faint {
+    opacity: 0.55;
+  }
+
+  .graph-svg-node rect {
+    fill: #171717;
+    stroke: #333;
+    stroke-width: 1;
+  }
+
+  .graph-svg-node.running rect {
+    fill: rgba(118, 185, 0, 0.12);
+    stroke: #76b900;
+  }
+
+  .graph-svg-node.loading rect {
+    fill: rgba(255, 209, 102, 0.10);
+    stroke: #ffd166;
+  }
+
+  .graph-svg-node.stopped rect {
+    fill: rgba(255, 107, 107, 0.08);
+    stroke: #5b2a2a;
+  }
+
+  .graph-svg-node text {
+    fill: #ececec;
+    font-size: 11px;
+    font-family: 'Monaco', 'Menlo', monospace;
+    pointer-events: none;
+  }
+
+  .graph-svg-node .graph-svg-sub {
+    fill: #9aa096;
+    font-size: 9px;
+  }
+
+  .graphify-lanes {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .graph-lane {
+    background: #0f0f0f;
+    border: 1px solid #242424;
+    border-radius: 6px;
+    padding: 0.45rem;
+    min-width: 0;
+  }
+
+  .graph-lane-title {
+    color: #76b900;
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    margin-bottom: 0.35rem;
+  }
+
+  .graph-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-height: 26px;
+    padding: 0.22rem 0.32rem;
+    border: 1px solid #2a2a2a;
+    border-radius: 5px;
+    color: #ddd;
+    font-size: 0.68rem;
+    margin-bottom: 0.25rem;
+    background: #151515;
+  }
+
+  .graph-chip span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .graph-chip strong {
+    color: #9aa096;
+    font-size: 0.58rem;
+    margin-left: auto;
+    text-align: right;
+    overflow-wrap: anywhere;
+  }
+
+  .graph-port-list {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.25rem;
+  }
+
+  .graph-port-list .graph-chip {
+    margin-bottom: 0;
+  }
+
+  .runtime-lane {
+    grid-column: 1 / -1;
+  }
+
+  .graph-runtime-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.35rem;
+  }
+
+  .graph-runtime-node {
+    border: 1px solid #2a2a2a;
+    background: #151515;
+    border-radius: 6px;
+    padding: 0.4rem;
+    min-width: 0;
+  }
+
+  .graph-runtime-node.running {
+    border-color: #76b900;
+    background: rgba(118, 185, 0, 0.09);
+  }
+
+  .graph-runtime-node.loading {
+    border-color: #ffd166;
+    background: rgba(255, 209, 102, 0.08);
+  }
+
+  .graph-runtime-node.stopped {
+    border-color: #3a2525;
+    background: rgba(255, 107, 107, 0.05);
+  }
+
+  .graph-runtime-top {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    min-width: 0;
+  }
+
+  .graph-runtime-name {
+    color: #fff;
+    font-family: 'Monaco', 'Menlo', monospace;
+    font-size: 0.72rem;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .graph-port {
+    color: #76b900;
+    font-size: 0.68rem;
+    font-weight: 800;
+  }
+
+  .graph-runtime-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.3rem;
+  }
+
+  .graph-runtime-meta span {
+    color: #c9d4c0;
+    background: rgba(118, 185, 0, 0.08);
+    border: 1px solid rgba(118, 185, 0, 0.18);
+    border-radius: 3px;
+    padding: 0.06rem 0.25rem;
+    font-size: 0.56rem;
+  }
+
+  .graph-runtime-model {
+    margin-top: 0.28rem;
+    color: #8d8d8d;
+    font-family: 'Monaco', 'Menlo', monospace;
+    font-size: 0.58rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .graph-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #777;
+    flex-shrink: 0;
+  }
+
+  .running .graph-dot { background: #76b900; }
+  .loading .graph-dot { background: #ffd166; }
+  .stopped .graph-dot { background: #ff6b6b; }
+  .unknown .graph-dot { background: #777; }
+
+  .graph-edge-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    margin-top: 0.45rem;
+  }
+
+  .graph-edge-list span {
+    color: #aaa;
+    background: #111;
+    border: 1px solid #242424;
+    border-radius: 4px;
+    padding: 0.16rem 0.35rem;
+    font-size: 0.58rem;
+  }
+
+  .graphify-empty {
+    color: #888;
+    font-size: 0.8rem;
+    padding: 0.5rem;
+  }
+
   .footer-compact {
     text-align: center;
     color: #444;
@@ -754,12 +2035,19 @@
   @media (max-width: 1200px) {
     .stats-row { grid-template-columns: repeat(3, 1fr); }
     .models-row { grid-template-columns: repeat(2, 1fr); }
-    .processes-compact { grid-template-columns: repeat(3, 1fr); }
+    .health-grid { grid-template-columns: 1fr; }
+    .health-subgrid { grid-template-columns: 1fr; }
+    .graphify-lanes { grid-template-columns: 1fr; }
+    .graph-runtime-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 
   @media (max-width: 768px) {
     .stats-row { grid-template-columns: repeat(2, 1fr); }
     .models-row { grid-template-columns: 1fr; }
-    .processes-compact { grid-template-columns: 1fr; }
+    .dgx-health-header { align-items: flex-start; flex-direction: column; }
+    .health-path { text-align: left; }
+    .interface-grid { grid-template-columns: 1fr; }
+    .port-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .graph-runtime-grid { grid-template-columns: 1fr; }
   }
 </style>

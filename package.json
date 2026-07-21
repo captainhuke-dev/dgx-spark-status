@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node dev-server.js",
     "build": "vite build",
+    "test": "node --test test/*.test.js",
     "preview": "vite preview --port 9000 --host 0.0.0.0",
     "start": "node server.js"
   },
