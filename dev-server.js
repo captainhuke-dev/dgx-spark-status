@@ -11,6 +11,7 @@ import {
   sendHermesLogo,
 } from './hermes-service.js';
 import { readModelRuntimeDetails } from './model-runtime-details.js';
+import { classifyInventoryConfig } from './model-inventory-section.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -1511,10 +1512,15 @@ async function getAvailableModels() {
         const env = parseEnvText(readFileSync(cfg, 'utf8'));
         if (!env.MODEL_PATH && !env.PORT) continue;
         env.__file = cfg;
-        if (isDs4RuntimeCandidate(env)) continue;
+        const classifiedRuntime = classifyEnvRuntime(env);
+        const inventoryConfig = classifyInventoryConfig(
+          env,
+          classifiedRuntime,
+          isDs4RuntimeCandidate(env)
+        );
+        if (!inventoryConfig.include) continue;
 
-        const runtime = classifyEnvRuntime(env);
-        const target = runtime === 'llama' ? models.llama : models.vllm;
+        const target = inventoryConfig.section === 'llama' ? models.llama : models.vllm;
         const name = envDisplayName(env);
         const displayName = name;
         const port = env.PORT ? parseInt(env.PORT, 10) : null;
@@ -1565,8 +1571,8 @@ async function getAvailableModels() {
             name,
             displayName,
             servedModelName,
-            functionLabel: envModelFunctionLabel(env, runtime),
-            connectionLabel: envConnectionLabel(env, runtime),
+            functionLabel: envModelFunctionLabel(env, classifiedRuntime),
+            connectionLabel: envConnectionLabel(env, classifiedRuntime),
             apiModel,
             sizeGB,
             path: isPlaceholderModelName(env.MODEL_PATH) && dashboardModelDisplayName(env) ? NEMOTRON3_MODEL_PATH : (env.MODEL_PATH || modelPath),
@@ -1576,8 +1582,8 @@ async function getAvailableModels() {
             host: envProbeHost(env),
             status,
             running: status === 'running',
-            runtime,
-            source: `custom-${runtime}-config`,
+            runtime: inventoryConfig.runtime,
+            source: `custom-${inventoryConfig.runtime}-config`,
             config: cfg
           });
         }
