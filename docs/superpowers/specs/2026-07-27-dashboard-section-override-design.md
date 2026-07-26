@@ -58,8 +58,10 @@ Status and health remain visible through `http://127.0.0.1:18082/v1/models`.
 ## Tailscale boundary
 
 Tailscale publishes only a raw TCP handler on node port 18082 forwarding to
-`127.0.0.1:18082`. The backend on 18081 remains loopback-only. Existing Serve
-handlers remain unchanged and Funnel remains disabled.
+`127.0.0.1:18082`. The required client base URL is
+`http://100.108.68.20:18082/v1`; direct IP-and-port access is a release gate,
+not an optional alias. The backend on 18081 remains loopback-only. Existing
+Serve handlers remain unchanged and Funnel remains disabled.
 
 Tailscale mutation requires root/operator authority and is independent of the
 Dashboard code change.
@@ -79,8 +81,9 @@ Live verification must prove:
 2. The metrics payload contains the model in the left inventory collection.
 3. The card metadata identifies DS4/DwarfStar, not llama.cpp.
 4. Both application listeners remain on `127.0.0.1`.
-5. The Tailscale endpoint rejects `max_tokens=32769` and accepts a bounded
-   request after the Serve route is successfully installed.
+5. `http://100.108.68.20:18082/v1/models` returns the DS4 model inventory.
+6. `http://100.108.68.20:18082/v1` rejects `max_tokens=32769` and accepts a
+   bounded request after the Serve route is successfully installed.
 
 ## Failure handling
 
