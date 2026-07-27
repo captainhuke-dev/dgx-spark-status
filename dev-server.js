@@ -1578,6 +1578,10 @@ async function getAvailableModels() {
             path: isPlaceholderModelName(env.MODEL_PATH) && dashboardModelDisplayName(env) ? NEMOTRON3_MODEL_PATH : (env.MODEL_PATH || modelPath),
             modelPath: isPlaceholderModelName(modelPath) && dashboardModelDisplayName(env) ? NEMOTRON3_MODEL_PATH : modelPath,
             ctx,
+            maxInputTokens: env.MAX_INPUT_TOKENS ? parseInt(env.MAX_INPUT_TOKENS, 10) : null,
+            maxOutputTokens: env.MAX_NEW_TOKENS || env.SERVER_MAX_OUTPUT
+              ? parseInt(env.MAX_NEW_TOKENS || env.SERVER_MAX_OUTPUT, 10)
+              : null,
             port,
             host: envProbeHost(env),
             status,

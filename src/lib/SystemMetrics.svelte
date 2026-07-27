@@ -3,6 +3,7 @@
   import { subscribe, getCurrentMetrics, isWebSocketConnected } from './websocket.js';
   import Gauge from './Gauge.svelte';
   import HermesSpotlight from './HermesSpotlight.svelte';
+  import { modelBudgetLabel } from '../../model-card-display.js';
 
   let metrics = $state(null);
   let connected = $state(false);
@@ -717,7 +718,7 @@
                     {#if model.sizeGB}<span class="model-size">{model.sizeGB} GB</span>{/if}
                     {#if isRunning && metrics.inference.llama.quantFormat}<span class="model-quant">{metrics.inference.llama.quantFormat}</span>{/if}
                     {#if isRunning && metrics.inference.llama.paramSize}<span class="model-params">{metrics.inference.llama.paramSize}</span>{/if}
-                    {#if model.ctx}<span class="model-params">ctx: {(model.ctx / 1024).toFixed(0)}K</span>{/if}
+                    {#if model.ctx}<span class="model-params">{modelBudgetLabel(model)}</span>{/if}
                     {#if isRunning && metrics.inference.llama.ctxSize}<span class="model-params active-ctx">active: {(metrics.inference.llama.ctxSize / 1024).toFixed(0)}K</span>{/if}
                   </div>
                   {#if control}
