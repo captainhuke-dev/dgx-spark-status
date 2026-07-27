@@ -5,10 +5,10 @@ import test from 'node:test';
 const runtimeConfig = readFileSync('/etc/vllm/models/deepseek-v4-flash-in240k-out32k.env', 'utf8');
 const controlConfig = readFileSync('/etc/dgx-model-control/models.d/deepseek-v4-flash-in240k-out32k.env', 'utf8');
 
-test('DS4 Dashboard card uses compact title and budget metadata', () => {
+test('DS4 Dashboard card uses compact title and 240K-total budget metadata', () => {
   assert.match(runtimeConfig, /^DISPLAY_NAME="DeepSeek V4 Flash DS4"$/m);
-  assert.match(runtimeConfig, /^CONTEXT_LENGTH=278528$/m);
-  assert.match(runtimeConfig, /^MAX_INPUT_TOKENS=245760$/m);
+  assert.match(runtimeConfig, /^CONTEXT_LENGTH=245760$/m);
+  assert.match(runtimeConfig, /^MAX_INPUT_TOKENS=212992$/m);
   assert.match(runtimeConfig, /^MAX_NEW_TOKENS=32768$/m);
 });
 
