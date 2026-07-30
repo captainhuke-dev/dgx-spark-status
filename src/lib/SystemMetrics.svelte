@@ -4,6 +4,7 @@
   import Gauge from './Gauge.svelte';
   import HermesSpotlight from './HermesSpotlight.svelte';
   import { modelBudgetLabel } from '../../model-card-display.js';
+  import { isActiveControlStatus, modelControlStatusLabel, resolveModelDisplayStatus } from '../../model-control-state.js';
 
   let metrics = $state(null);
   let connected = $state(false);
@@ -18,6 +19,7 @@
   let modelControls = $state([]);
   let modelControlError = $state('');
   let modelActions = $state({});
+  let stopAllAction = $state({});
   let ds4Action = $state({});
   let modelControlTimer = null;
   let graphTopology = $state(null);
@@ -201,10 +203,6 @@
     return control?.status || 'Unavailable';
   }
 
-  function isActiveControlStatus(status) {
-    return status === 'running' || status === 'loading' || status === 'starting';
-  }
-
   function controlErrorMessage(state) {
     if (!state?.error) return '';
     if (state.code === 'busy') {
@@ -278,6 +276,29 @@
       await loadModelControls();
     } catch (error) {
       modelActions = { ...modelActions, [profileId]: { busy: false, code: error.code, error: error.message || `${action} failed` } };
+      await loadModelControls();
+    }
+  }
+
+  async function runStopAllModels() {
+    if (!window.confirm('Stop all Dashboard-managed models that are currently running?')) return;
+    stopAllAction = { busy: true };
+    try {
+      const res = await fetch('/api/model-control/stop-all', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: 'KILL_ALL_MODELS' })
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        const detail = data.failures?.map(item => `${item.profile_id}: ${item.message}`).join(' · ');
+        throw new Error(detail || data.message || 'Kill all models failed');
+      }
+      const count = data.stopped?.length || 0;
+      stopAllAction = { busy: false, message: count ? `Stopped ${count} model preset${count === 1 ? '' : 's'}` : 'All models already stopped' };
+      await loadModelControls();
+    } catch (error) {
+      stopAllAction = { busy: false, error: error.message || 'Kill all models failed' };
       await loadModelControls();
     }
   }
@@ -614,6 +635,11 @@
             <span><span class="mem-dot os"></span>OS {processRssGB.toFixed(0)}G</span>
             <span><span class="mem-dot free"></span>Free {formatBytes(metrics.memory.available)}G</span>
           </div>
+          <button class="kill-all-models" disabled={stopAllAction.busy} onclick={runStopAllModels}>
+            {stopAllAction.busy ? 'Stopping all models…' : 'Kill All Models'}
+          </button>
+          {#if stopAllAction.message}<div class="kill-all-message">{stopAllAction.message}</div>{/if}
+          {#if stopAllAction.error}<div class="kill-all-error">{stopAllAction.error}</div>{/if}
         </div>
       {/if}
 
@@ -695,9 +721,10 @@
 	            {#if metrics.inference.availableModels?.llama}
 	              {#each sortModelsForDisplay(metrics.inference.availableModels.llama) as model}
 	                {@const runtimeModel = metrics.inference.llama.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias)) || model}
-	                {@const isRunning = runtimeModel ? (runtimeModel.status === 'running' || runtimeModel.status === 'loading') : (model.status ? (model.status === 'running' || model.status === 'loading') : false)}
-	                {@const displayPort = runtimeModel?.port || model.port || metrics.inference.llama.port}
+                  {@const displayPort = runtimeModel?.port || model.port || metrics.inference.llama.port}
                   {@const control = controlForModel(model, runtimeModel, displayPort)}
+                  {@const effectiveStatus = resolveModelDisplayStatus(control?.status, runtimeModel?.status, model.status)}
+	                {@const isRunning = isActiveControlStatus(effectiveStatus)}
                   {@const controlState = control ? actionState(control.profile_id) : {}}
 	                {@const noteId = `llama:${model.key || model.name}`}
                 <div class="model-item {isRunning ? 'loaded' : ''}">
@@ -708,7 +735,7 @@
                         <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
                       {/if}
                     </div>
-	                    {#if isRunning}<span class="running-badge">{(runtimeModel?.status || model.status || metrics.inference.llama.status) === 'running' ? 'Ready to Use' : 'Loading'}{#if displayPort} (:{displayPort}){/if}</span>{/if}
+	                    {#if isRunning}<span class="running-badge" class:degraded-badge={effectiveStatus === 'degraded_resident'}>{modelControlStatusLabel(effectiveStatus)}{#if displayPort} (:{displayPort}){/if}</span>{/if}
                   </div>
                   <div class="model-function">
                     {#if modelFunctionLabel(model, 'llama')}<span>{modelFunctionLabel(model, 'llama')}</span>{/if}
@@ -772,9 +799,10 @@
             {#if metrics.inference.availableModels?.vllm && metrics.inference.availableModels.vllm.length > 0}
               {#each sortModelsForDisplay(metrics.inference.availableModels.vllm) as model}
                 {@const runtimeModel = metrics.inference.vllm.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias))}
-                {@const isRunning = runtimeModel ? (runtimeModel.status === 'running' || runtimeModel.status === 'loading') : (model.status ? (model.status === 'running' || model.status === 'loading') : (metrics.inference.vllm.status !== 'stopped' && metrics.inference.vllm.model && model.name.includes(metrics.inference.vllm.model)))}
                 {@const displayPort = runtimeModel?.port || model.port}
                 {@const control = controlForModel(model, runtimeModel, displayPort)}
+                {@const effectiveStatus = resolveModelDisplayStatus(control?.status, runtimeModel?.status, model.status, (metrics.inference.vllm.status !== 'stopped' && metrics.inference.vllm.model && model.name.includes(metrics.inference.vllm.model)) ? metrics.inference.vllm.status : null)}
+                {@const isRunning = isActiveControlStatus(effectiveStatus)}
                 {@const controlState = control ? actionState(control.profile_id) : {}}
                 {@const noteId = `vllm:${model.name}`}
                 <div class="model-item {isRunning ? 'loaded' : ''}">
@@ -785,7 +813,7 @@
                         <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
                       {/if}
                     </div>
-                    {#if isRunning}<span class="running-badge">{(runtimeModel?.status || model.status || metrics.inference.vllm.status) === 'running' ? 'RUNNING' : 'LOADING'}{#if displayPort} :{displayPort}{/if}</span>{/if}
+                    {#if isRunning}<span class="running-badge" class:degraded-badge={effectiveStatus === 'degraded_resident'}>{modelControlStatusLabel(effectiveStatus)}{#if displayPort} :{displayPort}{/if}</span>{/if}
                   </div>
                   <div class="model-function">
                     {#if modelFunctionLabel(model, 'vllm')}<span>{modelFunctionLabel(model, 'vllm')}</span>{/if}
@@ -1319,6 +1347,24 @@
     flex-wrap: wrap;
   }
 
+  .kill-all-models {
+    width: 100%;
+    margin-top: 0.15rem;
+    border: 1px solid #8f3434;
+    border-radius: 4px;
+    padding: 0.28rem 0.4rem;
+    color: #ff8f8f;
+    background: #421818;
+    font-size: 0.62rem;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .kill-all-models:hover:not(:disabled) { background: #572020; border-color: #ff6b6b; }
+  .kill-all-models:disabled { opacity: 0.55; cursor: not-allowed; }
+  .kill-all-message, .kill-all-error { font-size: 0.56rem; line-height: 1.25; }
+  .kill-all-message { color: #76b900; }
+  .kill-all-error { color: #ff6b6b; }
+
   .mem-dot {
     width: 6px; height: 6px; border-radius: 50%;
     display: inline-block; vertical-align: middle; margin-right: 2px;
@@ -1518,6 +1564,11 @@
   .running-badge.stopped-badge {
     color: #ff6b6b;
     background: #4d1a1a;
+  }
+
+  .running-badge.degraded-badge {
+    color: #ffd166;
+    background: #4a3b12;
   }
 
   .model-info {

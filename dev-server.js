@@ -12,6 +12,10 @@ import {
 } from './hermes-service.js';
 import { readModelRuntimeDetails } from './model-runtime-details.js';
 import { classifyInventoryConfig } from './model-inventory-section.js';
+import { classifyManagedStatus, DEGRADED_RESIDENT_STATUS } from './model-control-state.js';
+import { readManagedProfileComponents } from './managed-profile-components.js';
+import { stopAllManagedModels } from './model-control-operations.js';
+import { createModelControlActionLock } from './model-control-action-lock.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -19,13 +23,12 @@ const hermesController = createHermesServiceController({
   execFile: execFileAsync,
   fetchImpl: globalThis.fetch,
 });
+const modelControlActionLock = createModelControlActionLock();
 const UPDATE_INTERVAL = 1000;
 const LLAMA_SERVER = 'http://127.0.0.1:8001';
 const MODELCTL = '/opt/dgx-model-control/modelctl';
 const DGX_HEALTH_LATEST = '/home/mctdgx01/dgx-health/logs/latest.json';
 const DGX_HEALTH_BASE_PORTS = [9000, 11000];
-const NEMOTRON3_VLLM020_DISPLAY_NAME = 'NVIDIA Nemotron 3 Super 120B A12B NVFP4 · vLLM 0.20.0 Docker · 256K';
-const NEMOTRON3_MODEL_PATH = '/home/mctdgx01/models/nvidia-nemotron-3-super-120b-a12b-nvfp4';
 const DS4_RUNTIME = Object.freeze({
   profile_id: 'ds4-deepseek-v4-flash-256k-8889',
   display_name: 'DeepSeek V4 Flash 256K',
@@ -704,6 +707,15 @@ async function startModelAsync(profile) {
   if (status.status === 'loading' || status.status === 'starting') {
     return { ok: true, profile_id: profile, action: 'start', status: status.status };
   }
+  if (status.status === DEGRADED_RESIDENT_STATUS) {
+    return {
+      ok: false,
+      code: 'managed_components_active',
+      message: 'Managed model components are still active. Stop the existing preset before starting again.',
+      status: status.status,
+      active_components: status.active_components || []
+    };
+  }
 
   const startCmd = String(status.start_cmd || '').trim();
   const tmuxSession = String(status.tmux_session || '').trim();
@@ -871,43 +883,12 @@ function envContextLength(env) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function sourceValue(source, ...keys) {
-  for (const key of keys) {
-    if (source?.[key] !== undefined && source?.[key] !== null && String(source[key]).trim() !== '') {
-      return source[key];
-    }
-  }
-  return '';
-}
-
 function isPlaceholderModelName(value) {
   const normalized = String(value || '').trim().toLowerCase();
   return !normalized || normalized === 'model' || normalized === '/model';
 }
 
-function isNemotron3Vllm020Source(source = {}) {
-  const haystack = [
-    sourceValue(source, 'API_MODEL_ID', 'api_model_id', 'MODEL_ID', 'model_id'),
-    sourceValue(source, 'SERVED_MODEL_NAME', 'served_model_name'),
-    sourceValue(source, 'MODEL_PATH', 'model_path'),
-    sourceValue(source, 'DISPLAY_NAME', 'display_name'),
-    sourceValue(source, 'MODEL_NAME', 'model_name'),
-    sourceValue(source, '__file', 'CONFIG_FILE', 'config_file', 'config'),
-    sourceValue(source, 'PROFILE_ID', 'profile_id'),
-    sourceValue(source, 'start_cmd')
-  ].join(' ').toLowerCase();
-
-  return haystack.includes('nemotron-3-super') || haystack.includes('auto-port-8393');
-}
-
-function dashboardModelDisplayName(source = {}) {
-  return isNemotron3Vllm020Source(source) ? NEMOTRON3_VLLM020_DISPLAY_NAME : null;
-}
-
 function envDisplayName(env) {
-  const fullName = dashboardModelDisplayName(env);
-  if (fullName) return fullName;
-
   const explicitName = env.DISPLAY_NAME || env.MODEL_NAME;
   if (explicitName && !isPlaceholderModelName(explicitName)) return explicitName;
 
@@ -919,18 +900,17 @@ function envDisplayName(env) {
 }
 
 function enrichModelControlProfile(profile = {}) {
-  const displayName = dashboardModelDisplayName(profile);
   const runtimeDetails = readModelRuntimeDetails(profile, readFileSync);
-  if (!displayName && !runtimeDetails) return profile;
+  const managedComponents = readManagedProfileComponents(profile);
+  const managedState = managedComponents.length
+    ? classifyManagedStatus(profile.status, managedComponents)
+    : null;
+  if (!runtimeDetails && !managedState) return profile;
 
   return {
     ...profile,
-    ...(displayName ? {
-      display_name: displayName,
-      model_name: displayName,
-      model_path: isPlaceholderModelName(profile.model_path) ? NEMOTRON3_MODEL_PATH : profile.model_path,
-      served_model_name: profile.api_model_id || profile.served_model_name
-    } : {}),
+    ...(managedState || {}),
+    ...(managedComponents.length ? { managed_components: managedComponents } : {}),
     ...(runtimeDetails ? { runtime_details: runtimeDetails } : {})
   };
 }
@@ -1144,7 +1124,7 @@ function mergeRuntimeInfo(base, env, profile) {
   const runtime = env ? classifyEnvRuntime(env) : normalizeRuntimeValue(base.runtime).includes('llama') ? 'llama' : 'vllm';
   const displayName = envDisplayName(env || {}) || profile?.DISPLAY_NAME || base.label;
   const rawModelPath = env?.MODEL_PATH || profile?.MODEL_PATH || null;
-  const modelPath = isPlaceholderModelName(rawModelPath) && dashboardModelDisplayName(env || profile || {}) ? NEMOTRON3_MODEL_PATH : rawModelPath;
+  const modelPath = rawModelPath;
   return {
     ...base,
     label: displayName || base.label,
@@ -1563,9 +1543,7 @@ async function getAvailableModels() {
           return !port && !m.port && ((env.MODEL_PATH && m.path === env.MODEL_PATH) || (name && m.name === name));
         });
         if (!already) {
-          const servedModelName = dashboardModelDisplayName(env)
-            ? (env.API_MODEL_ID || env.SERVED_MODEL_NAME || env.MODEL_ID || null)
-            : (env.SERVED_MODEL_NAME || env.MODEL_ID || null);
+          const servedModelName = env.SERVED_MODEL_NAME || env.MODEL_ID || null;
           target.push({
             key: name,
             name,
@@ -1575,8 +1553,8 @@ async function getAvailableModels() {
             connectionLabel: envConnectionLabel(env, classifiedRuntime),
             apiModel,
             sizeGB,
-            path: isPlaceholderModelName(env.MODEL_PATH) && dashboardModelDisplayName(env) ? NEMOTRON3_MODEL_PATH : (env.MODEL_PATH || modelPath),
-            modelPath: isPlaceholderModelName(modelPath) && dashboardModelDisplayName(env) ? NEMOTRON3_MODEL_PATH : modelPath,
+            path: env.MODEL_PATH || modelPath,
+            modelPath,
             ctx,
             maxInputTokens: env.MAX_INPUT_TOKENS ? parseInt(env.MAX_INPUT_TOKENS, 10) : null,
             maxOutputTokens: env.MAX_NEW_TOKENS || env.SERVER_MAX_OUTPUT
@@ -1890,7 +1868,7 @@ async function getVllmInfo() {
 	            endpoint: `http://127.0.0.1:${env.PORT}/v1/models`,
 	            port,
 	            ctxSize: envContextLength(env),
-	            modelPath: isPlaceholderModelName(env.MODEL_PATH) && dashboardModelDisplayName(env) ? NEMOTRON3_MODEL_PATH : (env.MODEL_PATH || null),
+            modelPath: env.MODEL_PATH || null,
 	            apiModel: env.API_MODEL_ID || null,
 	            config: cfg,
 	            source: 'custom-vllm-config'
@@ -2345,8 +2323,8 @@ async function startDevServer() {
     if (!validModelControlProfile(profile)) {
       return res.status(400).json({ ok: false, code: 'invalid_profile', message: 'Invalid profile id' });
     }
-    const result = await startModelAsync(profile);
-    res.status(result.ok ? 200 : 500).json(result);
+    const result = await modelControlActionLock.run(() => startModelAsync(profile));
+    res.status(result.ok ? 200 : result.code === 'busy' ? 409 : 500).json(result);
   });
 
   app.post('/api/model-control/stop/:profile', async (req, res) => {
@@ -2354,8 +2332,29 @@ async function startDevServer() {
     if (!validModelControlProfile(profile)) {
       return res.status(400).json({ ok: false, code: 'invalid_profile', message: 'Invalid profile id' });
     }
-    const result = await runModelctl(['stop', profile]);
-    res.status(result.ok ? 200 : 500).json(result);
+    const result = await modelControlActionLock.run(() => runModelctl(['stop', profile]));
+    res.status(result.ok ? 200 : result.code === 'busy' ? 409 : 500).json(result);
+  });
+
+  app.post('/api/model-control/stop-all', async (req, res) => {
+    if (req.body?.confirm !== 'KILL_ALL_MODELS') {
+      return res.status(400).json({
+        ok: false,
+        code: 'confirmation_required',
+        message: 'Explicit Kill All confirmation is required'
+      });
+    }
+    const result = await modelControlActionLock.run(async () => {
+      const listResult = enrichModelControlResult(await runModelctl(['list']));
+      if (!listResult?.ok) return listResult;
+      return stopAllManagedModels(listResult.profiles || [], {
+        stopProfile: profile => runModelctl(['stop', profile]),
+        statusProfile: async profile => enrichModelControlResult(await runModelctl(['status', profile])),
+        getLegacyDs4Status: () => getDs4Status(),
+        stopLegacyDs4: () => stopDs4Runtime('dashboard_stop_all')
+      });
+    });
+    res.status(result.ok ? 200 : result.code === 'busy' ? 409 : 500).json(result);
   });
 
   app.get('/api/graphify/topology', async (req, res) => {
