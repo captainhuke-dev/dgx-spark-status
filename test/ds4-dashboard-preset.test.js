@@ -45,3 +45,7 @@ test('DeepSeek uses a strict one-GiB floor and clears only proven stale weight-s
   assert.match(deepseekStartScript, /stale weight-server evidence cleared/);
   assert.match(deepseekStartScript, /kill -0 "\$weight_pid"/);
 });
+
+test('DeepSeek pins the single authorized 29-GiB weight-server reserve fallback', () => {
+  assert.match(deepseekStartScript, /--reserve-gb 29/);
+});
