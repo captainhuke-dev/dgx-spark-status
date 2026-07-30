@@ -47,6 +47,7 @@ coverage
 *.bak*
 .cache
 .superdesign/tmp/
+.worktrees/
 
 # Vercel
 .vercel
