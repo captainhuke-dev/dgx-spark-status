@@ -20,6 +20,7 @@
   let modelControlError = $state('');
   let modelActions = $state({});
   let stopAllAction = $state({});
+  let agentProcessActions = $state({ claude: {}, codex: {} });
   let ds4Action = $state({});
   let modelControlTimer = null;
   let graphTopology = $state(null);
@@ -300,6 +301,45 @@
     } catch (error) {
       stopAllAction = { busy: false, error: error.message || 'Kill all models failed' };
       await loadModelControls();
+    }
+  }
+
+  const agentProcessConfirmations = Object.freeze({ claude: 'STOP_CLAUDE', codex: 'STOP_CODEX' });
+  const agentProcessLabels = Object.freeze({ claude: 'Claude', codex: 'Codex' });
+
+  async function stopAgentFamily(family) {
+    const label = agentProcessLabels[family];
+    const confirmToken = agentProcessConfirmations[family];
+    if (!label || !confirmToken) return;
+    if (!window.confirm(`ปิด ${label} ทุก process ที่กำลังทำงานอยู่หรือไม่? session ของ ${label} จะถูกขัดจังหวะ`)) return;
+
+    agentProcessActions = { ...agentProcessActions, [family]: { busy: true, verb: 'stop' } };
+    try {
+      const res = await fetch(`/api/process-control/stop/${family}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm: confirmToken })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        const detail = data.failures?.map(item => `PID ${item.pid}: ${item.code}`).join(' · ');
+        throw new Error(detail || data.message || `ปิด ${label} ไม่สำเร็จ`);
+      }
+      const stopped = data.stopped?.length || 0;
+      const alreadyExited = data.alreadyExited?.length || 0;
+      const total = stopped + alreadyExited;
+      agentProcessActions = {
+        ...agentProcessActions,
+        [family]: {
+          busy: false,
+          message: total ? `ปิด ${label} แล้ว ${total} process` : `ไม่พบ ${label} process ที่กำลังทำงาน`
+        }
+      };
+    } catch (error) {
+      agentProcessActions = {
+        ...agentProcessActions,
+        [family]: { busy: false, error: error.message || `ปิด ${label} ไม่สำเร็จ` }
+      };
     }
   }
 
@@ -585,6 +625,18 @@
             <path d={sparklinePath(cpuHistory, 120, 28)} fill="none" stroke="#76b900" stroke-width="1.5" />
           </svg>
         </div>
+        <div class="agent-process-controls" aria-label="Claude and Codex process controls">
+          <button class="control-btn stop agent-process-stop" disabled={agentProcessActions.claude?.busy} onclick={() => stopAgentFamily('claude')}>
+            {agentProcessActions.claude?.busy ? 'กำลังปิด Claude…' : 'ปิด Claude'}
+          </button>
+          <button class="control-btn stop agent-process-stop" disabled={agentProcessActions.codex?.busy} onclick={() => stopAgentFamily('codex')}>
+            {agentProcessActions.codex?.busy ? 'กำลังปิด Codex…' : 'ปิด Codex'}
+          </button>
+        </div>
+        {#if agentProcessActions.claude?.message}<div class="control-message agent-process-feedback">Claude · {agentProcessActions.claude.message}</div>{/if}
+        {#if agentProcessActions.claude?.error}<div class="control-error agent-process-feedback">Claude · {agentProcessActions.claude.error}</div>{/if}
+        {#if agentProcessActions.codex?.message}<div class="control-message agent-process-feedback">Codex · {agentProcessActions.codex.message}</div>{/if}
+        {#if agentProcessActions.codex?.error}<div class="control-error agent-process-feedback">Codex · {agentProcessActions.codex.error}</div>{/if}
       </div>
 
       <!-- GPU -->
@@ -1364,6 +1416,15 @@
   .kill-all-message, .kill-all-error { font-size: 0.56rem; line-height: 1.25; }
   .kill-all-message { color: #76b900; }
   .kill-all-error { color: #ff6b6b; }
+
+  .agent-process-controls {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.3rem;
+    margin-top: 0.35rem;
+  }
+  .agent-process-stop { width: 100%; }
+  .agent-process-feedback { font-size: 0.56rem; line-height: 1.25; margin-top: 0.2rem; }
 
   .mem-dot {
     width: 6px; height: 6px; border-radius: 50%;
