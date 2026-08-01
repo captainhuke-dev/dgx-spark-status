@@ -12,6 +12,7 @@ import {
 } from './hermes-service.js';
 import { readModelRuntimeDetails } from './model-runtime-details.js';
 import { classifyInventoryConfig } from './model-inventory-section.js';
+import { mergeRunningLlamaProcess, modelMatchesRunningLlamaProcess } from './runtime-model-inventory.js';
 import { classifyManagedStatus, DEGRADED_RESIDENT_STATUS } from './model-control-state.js';
 import { readManagedProfileComponents } from './managed-profile-components.js';
 import { stopAllManagedModels } from './model-control-operations.js';
@@ -1580,7 +1581,10 @@ async function getAvailableModels() {
   try {
     const llamaProcesses = await getRunningLlamaProcesses();
     for (const proc of llamaProcesses) {
-      const configuredModel = models.llama.find(model => Number(model.port || 0) === Number(proc.port));
+      const configuredModel = models.llama.find(model =>
+        Number(model.port || 0) === Number(proc.port) ||
+        modelMatchesRunningLlamaProcess(model, proc)
+      );
       const probe = await probeOpenAIModels(proc.port, configuredModel?.host || '127.0.0.1');
       const status = probe.status === 'running' ? 'running' : 'loading';
       const apiModel = probe.models?.[0]?.id || proc.alias || null;
@@ -1593,48 +1597,13 @@ async function getAvailableModels() {
         } catch (e) {}
       }
 
-      models.vllm = models.vllm.filter(model => Number(model.port || 0) !== Number(proc.port));
-      const already = models.llama.some(model => Number(model.port || 0) === Number(proc.port));
-      if (already) {
-        models.llama = models.llama.map(model => Number(model.port || 0) === Number(proc.port)
-          ? {
-              ...model,
-              runtime: 'llama',
-              status,
-              running: status === 'running',
-              port: proc.port,
-              host: model.host || '127.0.0.1',
-              path: model.path || proc.modelPath,
-              modelPath: model.modelPath || proc.modelPath,
-              apiModel: model.apiModel || apiModel,
-              sizeGB: model.sizeGB || procSizeGB,
-              ctx: model.ctx || proc.context,
-              functionLabel: model.functionLabel || 'Plain GGUF · OpenAI-compatible API',
-              connectionLabel: model.connectionLabel || `llama-server · :${proc.port}${proc.context ? ` · ctx ${(proc.context / 1024).toFixed(0)}K` : ''}`
-            }
-          : model
-        );
-      } else {
-        models.llama.push({
-          key: proc.alias || proc.label,
-          name: proc.label,
-          displayName: proc.label,
-          servedModelName: proc.alias || null,
-          functionLabel: 'Plain GGUF · OpenAI-compatible API',
-          connectionLabel: `llama-server · :${proc.port}${proc.context ? ` · ctx ${(proc.context / 1024).toFixed(0)}K` : ''}`,
-          apiModel,
-          sizeGB: procSizeGB,
-          path: proc.modelPath,
-          modelPath: proc.modelPath,
-          ctx: proc.context,
-          port: proc.port,
-          host: '127.0.0.1',
-          status,
-          running: status === 'running',
-          runtime: 'llama',
-          source: 'llama-process'
-        });
-      }
+      const merged = mergeRunningLlamaProcess(models, proc, {
+        status,
+        sizeGB: procSizeGB,
+        apiModel
+      });
+      models.llama = merged.llama;
+      models.vllm = merged.vllm;
     }
   } catch (e) {}
 

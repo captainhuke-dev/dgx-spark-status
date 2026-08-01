@@ -4,6 +4,7 @@
   import Gauge from './Gauge.svelte';
   import HermesSpotlight from './HermesSpotlight.svelte';
   import { modelBudgetLabel } from '../../model-card-display.js';
+  import { buildMemoryDisplay } from '../../memory-display.js';
   import { isActiveControlStatus, modelControlStatusLabel, resolveModelDisplayStatus } from '../../model-control-state.js';
 
   let metrics = $state(null);
@@ -664,29 +665,28 @@
 
       <!-- Unified Memory -->
       {#if metrics.processes}
-        {@const totalUsedGB = (metrics.memory.total - metrics.memory.available) / (1024 ** 3)}
-        {@const processRssGB = metrics.processes.reduce((s, p) => s + parseFloat(p.memoryGB), 0)}
-        {@const gpuMemGB = Math.max(0, totalUsedGB - processRssGB)}
-        {@const gpuPct = (gpuMemGB / metrics.memory.totalGB) * 100}
-        {@const osPct = (processRssGB / metrics.memory.totalGB) * 100}
+        {@const memoryDisplay = buildMemoryDisplay(metrics.memory, metrics.processes, metrics.gpu)}
         <div class="card stat-card">
           <div class="stat-top">
             <div class="stat-info" style="width:100%">
               <h2>Memory</h2>
-              <div class="mem-total-compact">{totalUsedGB.toFixed(1)} / {metrics.memory.totalGB} GB</div>
+              <div class="mem-total-compact">{memoryDisplay.usedGB.toFixed(1)} / {memoryDisplay.totalGB.toFixed(2)} GB used</div>
             </div>
           </div>
           <div class="mem-bar-container">
             <div class="mem-bar">
-              <div class="mem-bar-gpu" style="width: {gpuPct}%"></div>
-              <div class="mem-bar-os" style="width: {osPct}%"></div>
+              <div class="mem-bar-gpu" style="width: {memoryDisplay.gpuPercent}%"></div>
+              <div class="mem-bar-os" style="width: {memoryDisplay.processPercent}%"></div>
+              <div class="mem-bar-other" style="width: {memoryDisplay.otherPercent}%"></div>
             </div>
           </div>
           <div class="mem-legend-compact">
-            <span><span class="mem-dot gpu"></span>GPU {gpuMemGB.toFixed(0)}G</span>
-            <span><span class="mem-dot os"></span>OS {processRssGB.toFixed(0)}G</span>
-            <span><span class="mem-dot free"></span>Free {formatBytes(metrics.memory.available)}G</span>
+            <span><span class="mem-dot gpu"></span>GPU {memoryDisplay.gpuMemoryGB.toFixed(0)}G</span>
+            <span><span class="mem-dot os"></span>Model RSS {memoryDisplay.processRssGB.toFixed(0)}G</span>
+            <span><span class="mem-dot other"></span>Other {memoryDisplay.otherUsedGB.toFixed(0)}G</span>
+            <span><span class="mem-dot free"></span>Free {memoryDisplay.freeGB.toFixed(1)}G</span>
           </div>
+          <div class="mem-availability">Available / RAMguard headroom: {memoryDisplay.availableGB.toFixed(1)}G</div>
           <button class="kill-all-models" disabled={stopAllAction.busy} onclick={runStopAllModels}>
             {stopAllAction.busy ? 'Stopping all models…' : 'Kill All Models'}
           </button>
@@ -1389,6 +1389,7 @@
   }
   .mem-bar-gpu { height: 100%; background: #ff9800; transition: width 0.5s; }
   .mem-bar-os { height: 100%; background: #00d4ff; transition: width 0.5s; }
+  .mem-bar-other { height: 100%; background: #8bc34a; transition: width 0.5s; }
   .mem-bar-disk { height: 100%; background: #9c27b0; transition: width 0.5s; }
 
   .mem-legend-compact {
@@ -1432,8 +1433,10 @@
   }
   .mem-dot.gpu { background: #ff9800; }
   .mem-dot.os { background: #00d4ff; }
+  .mem-dot.other { background: #8bc34a; }
   .mem-dot.disk { background: #9c27b0; }
   .mem-dot.free { background: #2a2a2a; border: 1px solid #555; }
+  .mem-availability { color: #76b900; font-size: 0.58rem; margin-top: 0.12rem; }
 
   /* Network */
   .net-stats {
