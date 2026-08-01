@@ -16,6 +16,7 @@ import { classifyManagedStatus, DEGRADED_RESIDENT_STATUS } from './model-control
 import { readManagedProfileComponents } from './managed-profile-components.js';
 import { stopAllManagedModels } from './model-control-operations.js';
 import { createModelControlActionLock } from './model-control-action-lock.js';
+import { createProcessController, validateStopRequest } from './process-control.js';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -24,6 +25,8 @@ const hermesController = createHermesServiceController({
   fetchImpl: globalThis.fetch,
 });
 const modelControlActionLock = createModelControlActionLock();
+const processControlActionLock = createModelControlActionLock();
+const processController = createProcessController({ execFile: execFileAsync });
 const UPDATE_INTERVAL = 1000;
 const LLAMA_SERVER = 'http://127.0.0.1:8001';
 const MODELCTL = '/opt/dgx-model-control/modelctl';
@@ -2302,6 +2305,20 @@ async function startDevServer() {
     }
     saveNotes(notes);
     res.json({ ok: true, notes });
+  });
+
+  app.post('/api/process-control/stop/:family', async (req, res) => {
+    const { family } = req.params;
+    const validation = validateStopRequest(family, req.body);
+    if (!validation.ok) {
+      return res.status(400).json({
+        ok: false,
+        code: validation.code,
+        message: 'A family-specific confirmation is required'
+      });
+    }
+    const result = await processControlActionLock.run(() => processController.stopFamily(family));
+    res.status(result.code === 'busy' ? 409 : result.ok ? 200 : 500).json(result);
   });
 
   // Model control API. Only calls the allowlisted modelctl helper.
