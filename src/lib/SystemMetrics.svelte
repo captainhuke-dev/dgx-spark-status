@@ -5,6 +5,7 @@
   import HermesSpotlight from './HermesSpotlight.svelte';
   import { modelBudgetLabel } from '../../model-card-display.js';
   import { buildMemoryDisplay } from '../../memory-display.js';
+  import { findModelControlProfile } from '../../model-control-matching.js';
   import { isActiveControlStatus, modelControlStatusLabel, resolveModelDisplayStatus } from '../../model-control-state.js';
 
   let metrics = $state(null);
@@ -133,67 +134,8 @@
     }
   }
 
-  function normalizeControlKey(value) {
-    return String(value || '')
-      .split('/')
-      .filter(Boolean)
-      .pop()
-      ?.replace(/\.(gguf|safetensors|bin|pt|pth|env)$/i, '')
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '') || '';
-  }
-
-  function modelControlKeys(model, runtimeModel) {
-    return [
-      model?.name,
-      model?.key,
-      model?.apiModel,
-      model?.modelAlias,
-      model?.modelPath,
-      model?.path,
-      runtimeModel?.name,
-      runtimeModel?.modelAlias,
-      runtimeModel?.apiModel,
-      runtimeModel?.path,
-      runtimeModel?.root
-    ].map(normalizeControlKey).filter(Boolean);
-  }
-
-  function profileControlKeys(profile) {
-    return [
-      profile?.profile_id,
-      profile?.display_name,
-      profile?.model_name,
-      profile?.served_model_name,
-      profile?.api_model_id,
-      profile?.model_path,
-      profile?.config_file
-    ].map(normalizeControlKey).filter(Boolean);
-  }
-
   function controlForModel(model, runtimeModel, displayPort) {
-    const controls = modelControls;
-    const enabledControls = controls.filter(profile => profile.control_enabled);
-    const port = Number(displayPort || runtimeModel?.port || model?.port || 0);
-    if (port) {
-      const byPort = enabledControls.find(profile => Number(profile.port) === port)
-        || controls.find(profile => Number(profile.port) === port);
-      if (byPort) return byPort;
-    }
-
-    const modelKeys = modelControlKeys(model, runtimeModel);
-    if (!modelKeys.length) return null;
-
-    const byEnabledName = enabledControls.find(profile => {
-      const profileKeys = profileControlKeys(profile);
-      return modelKeys.some(modelKey => profileKeys.includes(modelKey));
-    });
-    if (byEnabledName) return byEnabledName;
-
-    return controls.find(profile => {
-      const profileKeys = profileControlKeys(profile);
-      return modelKeys.some(modelKey => profileKeys.includes(modelKey));
-    }) || null;
+    return findModelControlProfile(model, runtimeModel, displayPort, modelControls);
   }
 
   function actionState(profileId) {
