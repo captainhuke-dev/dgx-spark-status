@@ -41,7 +41,7 @@ test('Hermes Spotlight compiles with fixed safe controls and accessible branding
   const dashboardSource = readFileSync(dashboardPath, 'utf8');
   assert.match(dashboardSource, /<h2>ETC<\/h2>/);
   assert.doesNotMatch(dashboardSource, /<h2>ETC \{#if metrics\.inference\.ollama\.available\}/);
-  assert.match(dashboardSource, /grid-template-columns:\s*minmax\(0, 26fr\)\s+minmax\(0, 34fr\)\s+minmax\(0, 40fr\)/);
+  assert.match(dashboardSource, /\.models-row\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
   assert.match(dashboardSource, /@media \(max-width: 1200px\)[\s\S]*?\.models-row \{ grid-template-columns: repeat\(2, 1fr\); \}/);
   assert.match(dashboardSource, /@media \(max-width: 768px\)[\s\S]*?\.models-row \{ grid-template-columns: 1fr; \}/);
 });

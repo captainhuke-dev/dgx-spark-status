@@ -1,8 +1,5 @@
 function normalizeControlKey(value) {
   return String(value || '')
-    .split('/')
-    .filter(Boolean)
-    .pop()
     ?.replace(/\.(gguf|safetensors|bin|pt|pth|env)$/i, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '') || '';

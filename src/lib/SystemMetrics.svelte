@@ -1446,7 +1446,7 @@
   /* Models row */
   .models-row {
     display: grid;
-    grid-template-columns: minmax(0, 26fr) minmax(0, 34fr) minmax(0, 40fr);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 0.5rem;
     margin-bottom: 0.5rem;
   }

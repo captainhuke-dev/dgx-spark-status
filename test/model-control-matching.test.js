@@ -10,6 +10,7 @@ const alphaProfile = {
   profile_id: 'deepseek-v4-flash-0731-alpha1-v052',
   display_name: 'DeepSeek V4 Flash 0731 Alpha-1',
   port: 18182,
+  model_path: '/home/mctdgx01/models/deepseek-v4-flash-entrpi-ds4-v0.5.2-0731/gguf',
   api_model_id: 'deepseek-v4-flash',
   served_model_name: 'deepseek-v4-flash',
   control_enabled: true,
@@ -20,6 +21,8 @@ const oldProfile = {
   profile_id: 'deepseek-v4-flash-in240k-out32k',
   display_name: 'DeepSeek V4 Flash DS4 — 245K / 32K — no-MTP',
   port: 18082,
+  model_path: '/home/mctdgx01/models/deepseek-v4-flash-entrpi-ds4-v0.4.2/gguf',
+  config_file: '/etc/vllm/models/deepseek-v4-flash-in240k-out32k.env',
   api_model_id: 'deepseek-v4-flash',
   served_model_name: 'deepseek-v4-flash',
   control_enabled: true,
@@ -33,6 +36,25 @@ test('same API alias does not make the stopped old card inherit Alpha-1 active s
     key: oldProfile.display_name,
     name: oldProfile.display_name,
     displayName: oldProfile.display_name,
+    port: 18081,
+    apiModel: 'deepseek-v4-flash'
+  };
+
+  const matched = findModelControlProfile(oldCard, oldCard, oldCard.port, [alphaProfile, oldProfile]);
+  assert.equal(matched?.profile_id, oldProfile.profile_id);
+  assert.equal(matched?.status, 'stopped');
+});
+
+test('does not let a shared gguf directory basename select the first profile', () => {
+  assert.equal(typeof findModelControlProfile, 'function');
+
+  const oldCard = {
+    key: oldProfile.display_name,
+    name: oldProfile.display_name,
+    displayName: oldProfile.display_name,
+    modelPath: oldProfile.model_path,
+    path: oldProfile.model_path,
+    config: oldProfile.config_file,
     port: 18081,
     apiModel: 'deepseek-v4-flash'
   };
