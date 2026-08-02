@@ -23,3 +23,9 @@ test('CPU controls expose busy and inline result feedback', () => {
   assert.match(dashboardUi, /control-message/);
   assert.match(dashboardUi, /control-error/);
 });
+
+test('GPU card exposes unified CUDA allocation even when GB10 VRAM totals are N/A', () => {
+  assert.match(dashboardUi, /CUDA allocation/);
+  assert.match(dashboardUi, /computeMemoryUsedMB/);
+  assert.match(dashboardUi, /unified memory/);
+});

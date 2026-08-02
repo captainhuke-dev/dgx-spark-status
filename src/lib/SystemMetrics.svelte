@@ -594,6 +594,10 @@
                 {#if gpu.temperatureGpu}{gpu.temperatureGpu}°C{/if}
                 {#if gpu.powerDraw !== null} • {gpu.powerDraw}W{/if}
               </div>
+              <div class="gpu-memory-detail">
+                CUDA allocation: {((gpu.computeMemoryUsedMB ?? 0) / 1024).toFixed(1)}G
+                {#if gpu.unifiedMemory} · unified memory{/if}
+              </div>
             </div>
           </div>
           <div class="sparkline-container">
@@ -612,23 +616,26 @@
           <div class="stat-top">
             <div class="stat-info" style="width:100%">
               <h2>Memory</h2>
-              <div class="mem-total-compact">{memoryDisplay.usedGB.toFixed(1)} / {memoryDisplay.totalGB.toFixed(2)} GB used</div>
+              <div class="mem-total-compact">{memoryDisplay.usedGB.toFixed(1)} / {memoryDisplay.totalGB.toFixed(2)} GB active (cache excluded)</div>
             </div>
           </div>
           <div class="mem-bar-container">
             <div class="mem-bar">
               <div class="mem-bar-gpu" style="width: {memoryDisplay.gpuPercent}%"></div>
-              <div class="mem-bar-os" style="width: {memoryDisplay.processPercent}%"></div>
               <div class="mem-bar-other" style="width: {memoryDisplay.otherPercent}%"></div>
+              <div class="mem-bar-cache" style="width: {memoryDisplay.cachePercent}%"></div>
+              <div class="mem-bar-free" style="width: {memoryDisplay.freePercent}%"></div>
             </div>
           </div>
           <div class="mem-legend-compact">
-            <span><span class="mem-dot gpu"></span>GPU {memoryDisplay.gpuMemoryGB.toFixed(0)}G</span>
-            <span><span class="mem-dot os"></span>Model RSS {memoryDisplay.processRssGB.toFixed(0)}G</span>
-            <span><span class="mem-dot other"></span>Other {memoryDisplay.otherUsedGB.toFixed(0)}G</span>
+            <span><span class="mem-dot gpu"></span>GPU alloc {memoryDisplay.gpuMemoryGB.toFixed(1)}G</span>
+            <span><span class="mem-dot os"></span>Model RSS* {memoryDisplay.processRssGB.toFixed(0)}G</span>
+            <span><span class="mem-dot other"></span>Active other {memoryDisplay.otherUsedGB.toFixed(1)}G</span>
+            <span><span class="mem-dot cache"></span>Cache {memoryDisplay.cacheGB.toFixed(1)}G</span>
             <span><span class="mem-dot free"></span>Free {memoryDisplay.freeGB.toFixed(1)}G</span>
           </div>
           <div class="mem-availability">Available / RAMguard headroom: {memoryDisplay.availableGB.toFixed(1)}G</div>
+          <div class="mem-availability">*Model RSS includes file-backed GGUF pages and is not additive to GPU/cache.</div>
           <button class="kill-all-models" disabled={stopAllAction.busy} onclick={runStopAllModels}>
             {stopAllAction.busy ? 'Stopping all models…' : 'Kill All Models'}
           </button>
@@ -1302,6 +1309,13 @@
     text-overflow: ellipsis;
   }
 
+  .gpu-memory-detail {
+    color: #ffb74d;
+    font-size: 0.58rem;
+    margin-top: 0.12rem;
+    white-space: nowrap;
+  }
+
   .sparkline-container {
     width: 100%;
     height: 28px;
@@ -1332,6 +1346,8 @@
   .mem-bar-gpu { height: 100%; background: #ff9800; transition: width 0.5s; }
   .mem-bar-os { height: 100%; background: #00d4ff; transition: width 0.5s; }
   .mem-bar-other { height: 100%; background: #8bc34a; transition: width 0.5s; }
+  .mem-bar-cache { height: 100%; background: #607d8b; transition: width 0.5s; }
+  .mem-bar-free { height: 100%; background: #2a2a2a; transition: width 0.5s; }
   .mem-bar-disk { height: 100%; background: #9c27b0; transition: width 0.5s; }
 
   .mem-legend-compact {
@@ -1376,6 +1392,7 @@
   .mem-dot.gpu { background: #ff9800; }
   .mem-dot.os { background: #00d4ff; }
   .mem-dot.other { background: #8bc34a; }
+  .mem-dot.cache { background: #607d8b; }
   .mem-dot.disk { background: #9c27b0; }
   .mem-dot.free { background: #2a2a2a; border: 1px solid #555; }
   .mem-availability { color: #76b900; font-size: 0.58rem; margin-top: 0.12rem; }

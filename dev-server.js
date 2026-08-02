@@ -2036,12 +2036,27 @@ async function getTopProcesses(limit = 10) {
 // Get NVIDIA GPU info using nvidia-smi
 async function getNvidiaGPUInfo() {
   try {
-    const { stdout } = await execAsync(
-      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits'
-    );
+    const [{ stdout }, computeResult] = await Promise.all([
+      execAsync(
+        'nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits'
+      ),
+      execAsync(
+        'nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits'
+      ).catch(() => ({ stdout: '' }))
+    ]);
+
+    const computeMemoryByUuid = new Map();
+    for (const line of computeResult.stdout.trim().split('\n')) {
+      if (!line.trim()) continue;
+      const [uuid, , , usedMemory] = line.split(',').map(s => s.trim());
+      const amount = parseFloat(usedMemory);
+      if (uuid && Number.isFinite(amount)) {
+        computeMemoryByUuid.set(uuid, (computeMemoryByUuid.get(uuid) || 0) + amount);
+      }
+    }
 
     const gpus = stdout.trim().split('\n').map(line => {
-      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerLimit] =
+      const [index, uuid, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerLimit] =
         line.split(',').map(s => s.trim());
 
       const parseValue = (val) => {
@@ -2052,6 +2067,7 @@ async function getNvidiaGPUInfo() {
 
       return {
         index: parseInt(index),
+        uuid,
         model: name,
         vendor: 'NVIDIA',
         memoryTotal: parseValue(memTotal),
@@ -2062,6 +2078,7 @@ async function getNvidiaGPUInfo() {
         memoryFreeGB: memFree === '[N/A]' ? null : parseFloat((parseValue(memFree) || 0).toFixed(2)),
         utilizationGpu: parseValue(utilGpu),
         utilizationMemory: parseValue(utilMem),
+        computeMemoryUsedMB: computeMemoryByUuid.get(uuid) || 0,
         temperatureGpu: parseValue(temp),
         powerDraw: parseValue(powerDraw),
         powerLimit: parseValue(powerLimit),
@@ -2122,6 +2139,9 @@ async function getSystemMetrics() {
         used: mem.used,
         active: mem.active,
         available: mem.available,
+        buffers: mem.buffers,
+        cached: mem.cached,
+        buffcache: mem.buffcache,
         usagePercent: parseFloat(((mem.used / mem.total) * 100).toFixed(2)),
         totalGB: parseFloat((mem.total / (1024 ** 3)).toFixed(2)),
         usedGB: parseFloat((mem.used / (1024 ** 3)).toFixed(2)),
