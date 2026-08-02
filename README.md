@@ -4,6 +4,37 @@ Real-time system monitoring dashboard for NVIDIA DGX Spark (GB10) with comprehen
 
 ![Dashboard Screenshot](docs/dashboard-screenshot.png)
 
+## Current DGX Spark Deployment (verified 2026-08-03)
+
+This checkout is the maintained Dashboard fork at
+[`captainhuke-dev/dgx-spark-status`](https://github.com/captainhuke-dev/dgx-spark-status).
+
+- **Active model:** DeepSeek V4 Flash 0731 Alpha-1, Entrpi DS4 v0.5.2
+- **Runtime settings:** DSPark host-mmap enabled, MTP disabled, context `278528` (272K), input `245760` (240K), output `32768` (32K)
+- **Dashboard:** `http://127.0.0.1:9000`
+- **Guarded client:** `127.0.0.1:18182`, LAN `192.168.0.21:18182`, Tailscale `100.108.68.20:18182`
+- **Backend:** `127.0.0.1:18181` only; it is not the public client endpoint
+- **Control profile:** `deepseek-v4-flash-0731-alpha1-v052`
+- **Verified state:** 0731 is `running/active`; the old `deepseek-v4-flash-in240k-out32k` profile is retained but `stopped/inactive`
+- **UI state:** LLAMA.cpp, vLLM, and ETC use equal desktop columns; Hermes portrait dimensions remain unchanged
+- **Validation:** `npm test` 64/64 and `npm run build` passed
+
+### Active-status troubleshooting
+
+The Dashboard matches a model card to its control profile by port, full model path,
+configuration path, and model identity. The shared API alias `deepseek-v4-flash`
+is not sufficient to mark the old card active. If the active badge is wrong, check
+the Dashboard 9000 control list and `/api/metrics` inventory before touching any
+model process.
+
+### Git restore points
+
+- `dashboard-0731-active-equal-columns-20260803` — current verified state
+- `dashboard-layout-before-equal-columns-20260803` — pre-layout snapshot
+
+The original upstream repository is
+[`thx0701/dgx-spark-status`](https://github.com/thx0701/dgx-spark-status).
+
 ## Features
 
 ### System Monitoring
@@ -37,8 +68,8 @@ Real-time system monitoring dashboard for NVIDIA DGX Spark (GB10) with comprehen
 ## Quick Start
 
 ```bash
-# Clone the repository
-git clone https://github.com/thx0701/dgx-spark-status.git
+# Clone the maintained fork
+git clone https://github.com/captainhuke-dev/dgx-spark-status.git
 cd dgx-spark-status
 
 # Install dependencies
@@ -166,7 +197,7 @@ NVIDIA DGX Spark (GB10) 即時系統監控面板，提供完整的 GPU、CPU、�
 ## 快速開始
 
 ```bash
-git clone https://github.com/thx0701/dgx-spark-status.git
+git clone https://github.com/captainhuke-dev/dgx-spark-status.git
 cd dgx-spark-status
 npm install
 npm run dev
