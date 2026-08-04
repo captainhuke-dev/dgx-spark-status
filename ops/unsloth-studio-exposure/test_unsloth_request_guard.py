@@ -1,5 +1,6 @@
 import email.message
 import importlib
+import inspect
 import io
 import json
 import pathlib
@@ -7,6 +8,7 @@ import socket
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 RUNTIME_DIR = pathlib.Path(__file__).resolve().parent
@@ -190,18 +192,42 @@ class HandlerHarnessMixin:
 
 
 class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
-    def test_defaults_match_task_requirements(self):
+    def test_create_server_public_interface_uses_canonical_loopback_binding(self):
         guard = load_guard_module()
 
         self.assertEqual(guard.UPSTREAM_HOST, '127.0.0.1')
         self.assertEqual(guard.DEFAULT_BIND_HOST, '127.0.0.1')
         self.assertEqual(guard.DEFAULT_BIND_PORT, 56828)
         self.assertEqual(guard.DEFAULT_MAX_OUTPUT_BUDGET, 32768)
+        self.assertEqual('(*, resolver=None)', str(inspect.signature(guard.create_server)))
 
         fake_resolver = FakeResolver()
-        server = guard.create_server(resolver=fake_resolver)
+        sentinel = object()
+
+        with mock.patch.object(guard, '_create_server', return_value=sentinel) as patched:
+            server = guard.create_server(resolver=fake_resolver)
+
+        self.assertIs(server, sentinel)
+        patched.assert_called_once_with(
+            resolver=fake_resolver,
+            server_address=('127.0.0.1', 56828),
+            bind_and_activate=True,
+        )
+
+    def test_private_create_server_binds_loopback_socket_when_activated(self):
+        guard = load_guard_module()
+        fake_resolver = FakeResolver()
+
+        server = guard._create_server(
+            resolver=fake_resolver,
+            server_address=('127.0.0.1', 0),
+            bind_and_activate=True,
+        )
         try:
-            self.assertEqual(server.server_address, ('127.0.0.1', 56828))
+            self.assertGreaterEqual(server.fileno(), 0)
+            host, port = server.socket.getsockname()
+            self.assertEqual(host, '127.0.0.1')
+            self.assertGreater(port, 0)
             self.assertEqual(server.guard_config.max_output_budget, 32768)
             self.assertIs(server.resolver, fake_resolver)
         finally:

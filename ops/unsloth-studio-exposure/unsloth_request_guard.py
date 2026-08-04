@@ -314,16 +314,21 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
         self.close_connection = True
 
 
-def create_server(
+def _create_server(
     config: GuardConfig | None = None,
     *,
     resolver=None,
+    server_address: tuple[str, int] | None = None,
     bind_and_activate: bool = False,
     connection_factory: Callable[[str, int, float], object] | None = None,
 ) -> GuardHTTPServer:
     guard_config = config or GuardConfig()
+    resolved_server_address = server_address or (
+        guard_config.bind_host,
+        guard_config.bind_port,
+    )
     server = GuardHTTPServer(
-        (guard_config.bind_host, guard_config.bind_port),
+        resolved_server_address,
         RequestGuardHandler,
         bind_and_activate=bind_and_activate,
     )
@@ -331,6 +336,14 @@ def create_server(
     server.resolver = resolver or BackendResolver()
     server.upstream_connection_factory = connection_factory or default_connection_factory
     return server
+
+
+def create_server(*, resolver=None):
+    return _create_server(
+        resolver=resolver,
+        server_address=(DEFAULT_BIND_HOST, DEFAULT_BIND_PORT),
+        bind_and_activate=True,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -354,7 +367,11 @@ def main(argv: list[str] | None = None) -> int:
         max_request_body_bytes=args.max_request_body_bytes,
         upstream_timeout_seconds=args.upstream_timeout_seconds,
     )
-    server = create_server(config, bind_and_activate=True)
+    server = _create_server(
+        config,
+        server_address=(DEFAULT_BIND_HOST, DEFAULT_BIND_PORT),
+        bind_and_activate=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
