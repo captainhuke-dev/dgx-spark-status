@@ -904,7 +904,7 @@ Run npm run preview to preview your production build locally.
 
 ## Fix round 2 — HTTP/LAN clipboard fallback
 
-Implementation commit SHA: `TBD_AFTER_COMMIT`
+Implementation commit SHA: `2cb6c45c17837e6c9041559dd9ca5de28ba10ac9`
 
 Implementation commit message: `Add HTTP copy fallback for model IDs`
 
