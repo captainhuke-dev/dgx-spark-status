@@ -3,6 +3,7 @@ import si from 'systeminformation';
 import express from 'express';
 import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
+import { pathToFileURL } from 'url';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync, openSync, closeSync } from 'fs';
 import {
   createHermesServiceController,
@@ -12,7 +13,12 @@ import {
 } from './hermes-service.js';
 import { readModelRuntimeDetails } from './model-runtime-details.js';
 import { classifyInventoryConfig } from './model-inventory-section.js';
-import { mergeRunningLlamaProcess, modelMatchesRunningLlamaProcess } from './runtime-model-inventory.js';
+import { parseRunningLlamaProcessLine, selectedLlamaPorts } from './llama-process-inventory.js';
+import {
+  clientPortForLlamaProcess,
+  mergeRunningLlamaProcess,
+  modelMatchesRunningLlamaProcess
+} from './runtime-model-inventory.js';
 import { selectPreferredLlamaRuntime } from './llama-runtime-selection.js';
 import { classifyManagedStatus, DEGRADED_RESIDENT_STATUS } from './model-control-state.js';
 import { readManagedProfileComponents } from './managed-profile-components.js';
@@ -832,30 +838,15 @@ function classifyEnvRuntime(env) {
   return 'vllm';
 }
 
-function parseCommandArg(command, flags) {
-  const escaped = flags.map(flag => flag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
-  const match = String(command || '').match(new RegExp(`(?:^|\\s)(?:${escaped})(?:=|\\s+)([^\\s]+)`));
-  return match ? match[1] : null;
+function numericPort(value) {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
 async function getRunningLlamaProcesses() {
   try {
-    const { stdout } = await execAsync("ps -eo args | grep -E '[/]llama-server( |$)' | grep -v grep || true");
-    return stdout.trim().split('\n').filter(Boolean).map(command => {
-      const port = parseInt(parseCommandArg(command, ['--port', '-p']) || '', 10);
-      const modelPath = parseCommandArg(command, ['--model', '-m']);
-      const alias = parseCommandArg(command, ['--alias']);
-      const context = parseInt(parseCommandArg(command, ['--ctx-size', '-c']) || '', 10);
-      const baseName = modelPath ? modelPath.split('/').filter(Boolean).pop() : '';
-      return {
-        command,
-        port: Number.isFinite(port) ? port : null,
-        modelPath,
-        alias,
-        context: Number.isFinite(context) ? context : null,
-        label: alias || baseName?.replace(/\.gguf.*$/i, '') || `llama.cpp :${port}`
-      };
-    }).filter(item => item.port);
+    const { stdout } = await execAsync("ps -eo pid=,ppid=,lstart=,args= | grep -E '[/]llama-server( |$)' | grep -v grep || true");
+    return stdout.trim().split('\n').filter(Boolean).map(parseRunningLlamaProcessLine).filter(item => item?.port);
   } catch (error) {
     return [];
   }
@@ -902,6 +893,22 @@ function envDisplayName(env) {
 
   if (env.API_MODEL_ID && !isPlaceholderModelName(env.API_MODEL_ID)) return env.API_MODEL_ID;
   return (env.MODEL_PATH || '').split('/').filter(Boolean).pop();
+}
+
+function configuredLlamaCandidateMatchesProcess(candidate = {}, process = {}) {
+  const candidateClientPort = numericPort(candidate.clientPort ?? candidate.port);
+  const processClientPort = numericPort(process.clientPort);
+  if (candidateClientPort && processClientPort && candidateClientPort === processClientPort) return true;
+
+  return modelMatchesRunningLlamaProcess({
+    apiModel: candidate.liveApiModelId || candidate.env?.API_MODEL_ID || null,
+    servedModelName: candidate.env?.SERVED_MODEL_NAME || candidate.env?.MODEL_ID || null,
+    modelAlias: candidate.env?.API_MODEL_ID || null,
+    name: envDisplayName(candidate.env || {}),
+    key: envDisplayName(candidate.env || {}),
+    modelPath: candidate.modelPath || candidate.env?.MODEL_PATH || null,
+    path: candidate.modelPath || candidate.env?.MODEL_PATH || null
+  }, process);
 }
 
 function enrichModelControlProfile(profile = {}) {
@@ -1566,6 +1573,8 @@ async function getAvailableModels() {
               ? parseInt(env.MAX_NEW_TOKENS || env.SERVER_MAX_OUTPUT, 10)
               : null,
             port,
+            clientPort: port,
+            backendPort: port,
             host: envProbeHost(env),
             status,
             running: status === 'running',
@@ -1636,6 +1645,8 @@ async function getLlamaInfo() {
           env,
           cfg,
           port,
+          clientPort: port,
+          backendPort: port,
           probeHost,
           server,
           healthy: false,
@@ -1660,19 +1671,22 @@ async function getLlamaInfo() {
     } catch (e) {}
 
     for (const proc of runningLlamaProcesses) {
-      const matchingConfig = llamaConfigs.find(candidate => Number(candidate.port) === Number(proc.port));
+      const matchingConfig = llamaConfigs.find(candidate => configuredLlamaCandidateMatchesProcess(candidate, proc));
       const probeHost = matchingConfig ? matchingConfig.probeHost : '127.0.0.1';
       const server = `http://${probeHost}:${proc.port}`;
+      const clientPort = numericPort(matchingConfig?.clientPort) || clientPortForLlamaProcess(proc);
       const candidate = {
         source: 'process',
         process: proc,
         env: matchingConfig?.env || {
-          PORT: String(proc.port),
+          PORT: String(clientPort || proc.port),
           MODEL_PATH: proc.modelPath || '',
           API_MODEL_ID: ''
         },
         cfg: matchingConfig?.cfg || null,
         port: proc.port,
+        clientPort,
+        backendPort: proc.port,
         probeHost,
         server,
         healthy: false,
@@ -1690,9 +1704,10 @@ async function getLlamaInfo() {
           candidate.healthy = true;
           candidate.liveApiModelId = firstModel.id;
           candidate.modelPath = firstModel.root || candidate.modelPath;
+          if (matchingConfig) matchingConfig.backendPort = proc.port;
           if (!matchingConfig) {
             candidate.env = {
-              PORT: String(proc.port),
+              PORT: String(clientPort || proc.port),
               MODEL_PATH: proc.modelPath || candidate.modelPath || '',
               API_MODEL_ID: firstModel.id
             };
@@ -1707,7 +1722,7 @@ async function getLlamaInfo() {
     });
 
     if (selectedRuntime) {
-      llamaPort = selectedRuntime.port;
+      llamaPort = selectedLlamaPorts(selectedRuntime, selectedRuntime.port).port || llamaPort;
       llamaServer = selectedRuntime.server;
       llamaConfig = {
         env: selectedRuntime.env,
@@ -1828,6 +1843,8 @@ async function getLlamaInfo() {
 
     const status = healthy ? 'running' : (loading || processRunning ? 'loading' : 'stopped');
 
+    const resolvedPorts = selectedLlamaPorts(selectedRuntime, llamaPort);
+
     return {
       engine: 'llama.cpp',
       available: status !== 'stopped',
@@ -1837,8 +1854,9 @@ async function getLlamaInfo() {
       ctxSize,
       quantFormat,
       paramSize,
-      port: llamaPort,
-      proxyPort: llamaPort,
+      port: resolvedPorts.port,
+      backendPort: resolvedPorts.backendPort,
+      proxyPort: resolvedPorts.proxyPort,
       config: llamaConfig?.cfg || null,
       modelPath: llamaConfig?.env?.MODEL_PATH || null
     };
@@ -2472,7 +2490,9 @@ async function startDevServer() {
   });
 }
 
-startDevServer().catch(err => {
-  console.error('Failed to start dev server:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  startDevServer().catch(err => {
+    console.error('Failed to start dev server:', err);
+    process.exit(1);
+  });
+}

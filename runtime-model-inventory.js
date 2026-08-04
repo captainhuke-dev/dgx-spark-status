@@ -6,6 +6,32 @@ function normalizedPath(value) {
   return normalized(value).replace(/\/+$/, '');
 }
 
+export const UNSLOTH_STUDIO_ROOT = '/home/mctdgx01/apps/unsloth-studio';
+export const UNSLOTH_STUDIO_CLIENT_PORT = 56827;
+
+function numericPort(value) {
+  const parsed = Number(value || 0);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function isUnslothStudioProcess(process = {}) {
+  const command = String(process.command || '');
+  return command.includes(`${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server`);
+}
+
+export function clientPortForLlamaProcess(process = {}) {
+  if (isUnslothStudioProcess(process)) return UNSLOTH_STUDIO_CLIENT_PORT;
+  return numericPort(process.clientPort ?? process.port);
+}
+
+function backendPortForLlamaProcess(process = {}) {
+  return numericPort(process.backendPort ?? process.port);
+}
+
+function connectionLabelForProcess(process = {}, displayPort = null) {
+  return `llama-server · :${displayPort}${process.context ? ` · ctx ${(process.context / 1024).toFixed(0)}K` : ''}`;
+}
+
 export function modelMatchesRunningLlamaProcess(model = {}, process = {}) {
   const processAlias = normalized(process.alias);
   const modelIds = [
@@ -29,20 +55,24 @@ export function modelMatchesRunningLlamaProcess(model = {}, process = {}) {
 function processInventoryItem(process, { status, sizeGB, apiModel } = {}) {
   const resolvedStatus = status || 'running';
   const resolvedModel = String(apiModel || '').trim() || null;
+  const clientPort = clientPortForLlamaProcess(process);
+  const backendPort = backendPortForLlamaProcess(process);
+  const displayPort = clientPort || backendPort;
   return {
     key: process.alias || process.label,
     name: process.label,
     displayName: process.label,
     servedModelName: resolvedModel,
     functionLabel: 'Plain GGUF · OpenAI-compatible API',
-    connectionLabel: `llama-server · :${process.port}${process.context ? ` · ctx ${(process.context / 1024).toFixed(0)}K` : ''}`,
+    connectionLabel: connectionLabelForProcess(process, displayPort),
     apiModel: resolvedModel,
     sizeGB: sizeGB ?? null,
     path: process.modelPath,
     modelPath: process.modelPath,
     ctx: process.context,
-    port: process.port,
-    backendPort: process.port,
+    port: displayPort,
+    clientPort,
+    backendPort,
     host: '127.0.0.1',
     status: resolvedStatus,
     running: resolvedStatus === 'running',
@@ -70,7 +100,10 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
 
   const configured = next.llama[index];
   const status = details.status || 'running';
-  const displayPort = configured.port || process.port;
+  const processClientPort = clientPortForLlamaProcess(process);
+  const processBackendPort = backendPortForLlamaProcess(process);
+  const clientPort = numericPort(configured.clientPort || configured.port) || processClientPort || processBackendPort;
+  const displayPort = clientPort || processBackendPort;
   const liveApiModel = String(details.apiModel || '').trim() || null;
   next.llama[index] = {
     ...configured,
@@ -78,7 +111,8 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     status,
     running: status === 'running',
     port: displayPort,
-    backendPort: process.port,
+    clientPort,
+    backendPort: processBackendPort,
     host: configured.host || '127.0.0.1',
     path: configured.path || process.modelPath,
     modelPath: configured.modelPath || process.modelPath,
@@ -87,7 +121,7 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     sizeGB: configured.sizeGB ?? details.sizeGB ?? null,
     ctx: configured.ctx || process.context,
     functionLabel: configured.functionLabel || 'Plain GGUF · OpenAI-compatible API',
-    connectionLabel: configured.connectionLabel || `llama-server · :${displayPort}${process.context ? ` · ctx ${(process.context / 1024).toFixed(0)}K` : ''}`
+    connectionLabel: configured.connectionLabel || connectionLabelForProcess(process, displayPort)
   };
   return next;
 }

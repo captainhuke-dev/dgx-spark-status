@@ -771,7 +771,7 @@
 	            {#if metrics.inference.availableModels?.llama}
 	              {#each sortModelsForDisplay(metrics.inference.availableModels.llama) as model}
 	                {@const runtimeModel = metrics.inference.llama.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias)) || model}
-                  {@const displayPort = runtimeModel?.port || model.port || metrics.inference.llama.port}
+                  {@const displayPort = runtimeModel?.clientPort || model.clientPort || runtimeModel?.port || model.port || metrics.inference.llama.proxyPort || metrics.inference.llama.port}
                   {@const control = controlForModel(model, runtimeModel, displayPort)}
                   {@const effectiveStatus = resolveModelDisplayStatus(control?.status, runtimeModel?.status, model.status)}
 	                {@const isRunning = isActiveControlStatus(effectiveStatus)}

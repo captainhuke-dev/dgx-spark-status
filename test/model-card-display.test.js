@@ -71,6 +71,7 @@ test('SystemMetrics renders full model ID rows with copy buttons for llama, vLLM
   assert.match(dashboardUi, /\{copied \? 'Copied' : 'Copy'\}/);
   assert.equal((dashboardUi.match(/aria-label="Copy full model ID"/g) || []).length, 3);
   assert.equal((dashboardUi.match(/title="Copy full model ID"/g) || []).length, 3);
+  assert.match(dashboardUi, /\{@const displayPort = runtimeModel\?\.clientPort \|\| model\.clientPort \|\| runtimeModel\?\.port \|\| model\.port \|\| metrics\.inference\.llama\.proxyPort \|\| metrics\.inference\.llama\.port\}/);
   assert.doesNotMatch(dashboardUi, />\s*Model ID\s*</);
   assert.doesNotMatch(dashboardUi, /class="model-id-label"/);
   assert.doesNotMatch(dashboardUi, /\.model-id-value\s*\{[^}]*text-overflow\s*:\s*ellipsis/);
