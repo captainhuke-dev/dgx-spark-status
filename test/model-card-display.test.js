@@ -47,6 +47,15 @@ test('SystemMetrics renders full model ID rows with copy buttons for llama, vLLM
   assert.equal((dashboardUi.match(/class="model-id-copy"/g) || []).length, 3);
   assert.equal((dashboardUi.match(/onclick=\{\(\) => copyModelId\(liveModelId\)\}/g) || []).length, 3);
   assert.match(dashboardUi, /await navigator\.clipboard\.writeText\(modelId\);/);
+  assert.match(dashboardUi, /const textarea = document\.createElement\('textarea'\);/);
+  assert.match(dashboardUi, /textarea\.readOnly = true;/);
+  assert.match(dashboardUi, /textarea\.value = modelId;/);
+  assert.match(dashboardUi, /document\.body\.appendChild\(textarea\);/);
+  assert.match(dashboardUi, /textarea\.select\(\);/);
+  assert.match(dashboardUi, /textarea\.setSelectionRange\(0,\s*textarea\.value\.length\);/);
+  assert.match(dashboardUi, /copied = document\.execCommand\('copy'\);/);
+  assert.match(dashboardUi, /textarea\.remove\(\);/);
+  assert.doesNotMatch(dashboardUi, /if \(!modelId \|\| typeof navigator === 'undefined' \|\| !navigator\.clipboard\?\.writeText\) return;/);
   assert.match(dashboardUi, /\{copied \? 'Copied' : 'Copy'\}/);
   assert.equal((dashboardUi.match(/aria-label="Copy full model ID"/g) || []).length, 3);
   assert.equal((dashboardUi.match(/title="Copy full model ID"/g) || []).length, 3);

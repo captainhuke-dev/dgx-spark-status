@@ -190,10 +190,33 @@
   }
 
   async function copyModelId(modelId) {
-    if (!modelId || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return;
+    if (!modelId) return;
 
+    let copied = false;
     try {
-      await navigator.clipboard.writeText(modelId);
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(modelId);
+        copied = true;
+      } else if (typeof document !== 'undefined' && document.body) {
+        const textarea = document.createElement('textarea');
+        textarea.value = modelId;
+        textarea.readOnly = true;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        textarea.style.pointerEvents = 'none';
+        document.body.appendChild(textarea);
+        try {
+          textarea.focus();
+          textarea.select();
+          textarea.setSelectionRange(0, textarea.value.length);
+          copied = document.execCommand('copy');
+        } finally {
+          textarea.remove();
+        }
+      }
+
+      if (!copied) return;
+
       copiedModelIds = { ...copiedModelIds, [modelId]: true };
       if (modelIdCopyResetTimers.has(modelId)) clearTimeout(modelIdCopyResetTimers.get(modelId));
       modelIdCopyResetTimers.set(modelId, setTimeout(() => {
