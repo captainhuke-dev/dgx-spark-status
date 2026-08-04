@@ -573,7 +573,7 @@ Run npm run preview to preview your production build locally.
 
 ## Fix round 1 — full visible IDs plus copy buttons
 
-Implementation commit SHA: `TBD_AFTER_COMMIT`
+Implementation commit SHA: `aaebd2d46bb9ed92bdd5652549635e416e610c4a`
 
 Implementation commit message: `Show full model IDs with copy buttons`
 
