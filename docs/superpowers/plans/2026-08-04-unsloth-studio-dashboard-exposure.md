@@ -3,7 +3,7 @@
 
 **Goal:** Make the live Unsloth Studio model visible in Dashboard 9000 with its exact API model ID, keep live-process status authoritative, and expose the guarded OpenAI-compatible endpoint on LAN and the specified Tailscale IP while leaving the Studio-owned backend loopback-only.
 
-**Architecture:** Dashboard inventory continues discovering `llama-server` processes dynamically. A live `/v1/models` response supplies the model ID and wins over stale or absent static configuration. The UI renders that value as a dedicated `Model ID` field. A generic request-guard sidecar forwards only approved model API paths from `127.0.0.1:56828` to the Studio backend at `127.0.0.1:56827`, validates output-token budgets, and preserves streaming. A specific-address LAN `socat` listener exposes `192.168.0.21:56827` to the guard, while Tailscale Serve maps Tailscale TCP `56827` to the same guard. Studio keeps ownership of the model process and its original loopback port.
+**Architecture:** Dashboard inventory continues discovering `llama-server` processes dynamically. A live `/v1/models` response supplies the model ID and wins over stale or absent static configuration. The UI renders that value as a dedicated, fully visible value row with a Copy action; it does not add a visible `Model ID` label. A generic request-guard sidecar forwards only approved model API paths from `127.0.0.1:56828` to the Studio backend at `127.0.0.1:56827`, validates output-token budgets, and preserves streaming. A specific-address LAN `socat` listener exposes `192.168.0.21:56827` to the guard, while Tailscale Serve maps Tailscale TCP `56827` to the same guard. Studio keeps ownership of the model process and its original loopback port.
 
 **Tech Stack:** Node.js ESM, Svelte 5, Node test runner, Python 3 standard library, `socat`, Tailscale Serve, existing Dashboard/Vite dev server.
 
@@ -46,9 +46,9 @@
 
 **Files:** `src/lib/SystemMetrics.svelte`, `test/model-card-display.test.js`.
 
-1. Add a focused source/behavior test that requires a visible `Model ID` label for LLAMA, vLLM, and ETC cards and verifies the value is sourced from `apiModel`/served metadata rather than a display-name fallback.
-2. Update `SystemMetrics.svelte` to import the shared helper and render a separate, always-labeled `Model ID` row whenever a real ID is available. Keep the existing display title and connection/status rows unchanged.
-3. Use truncation/tooltip styling suitable for long Hugging Face IDs without hiding the full value from the title attribute or API response.
+1. Add a focused source/behavior test that requires a full live ID value and Copy action for LLAMA, vLLM, and ETC cards, and verifies the value is sourced from `apiModel`/served metadata rather than a display-name fallback.
+2. Update `SystemMetrics.svelte` to import the shared helper and render a separate full-value row with a Copy action whenever a real ID is available. Keep the existing display title and connection/status rows unchanged, and do not render a visible `Model ID` label.
+3. Use wrapping/overflow-safe styling suitable for long Hugging Face IDs so the full value remains visible, with the full ID retained in the title attribute and copy action.
 4. Run the focused UI/model-card tests and `npm test`.
 
 ## Task 4: Add and test the generic Unsloth request guard
