@@ -118,6 +118,9 @@ class BackendResolver:
         self._inspector = inspector or RealInspector()
         self._studio_root = studio_root.rstrip('/')
         self._studio_llama_server = f'{self._studio_root}/llama.cpp/llama-server'
+        self._studio_interpreter = (
+            f'{self._studio_root}/unsloth_studio/bin/python'
+        )
         self._studio_launcher = f'{self._studio_root}/bin/unsloth'
         self._time_fn = time_fn
         self._cache_ttl_seconds = cache_ttl_seconds
@@ -222,7 +225,12 @@ class BackendResolver:
                 return False
             if (
                 _path_within_root(parent.executable, self._studio_root)
-                or _is_studio_launcher_command(parent.command, self._studio_launcher)
+                or _is_studio_launcher_command(
+                    parent.executable,
+                    parent.command,
+                    self._studio_interpreter,
+                    self._studio_launcher,
+                )
             ):
                 return True
             current_pid = parent.ppid
@@ -295,18 +303,26 @@ def _parse_port_flag(command: str) -> int | None:
     return None
 
 
-def _is_studio_launcher_command(command: str, launcher_path: str) -> bool:
+def _is_studio_launcher_command(
+    executable: str,
+    command: str,
+    interpreter_path: str,
+    launcher_path: str,
+) -> bool:
     try:
         argv = shlex.split(command)
     except ValueError:
         return False
 
-    expected_launcher = os.path.realpath(os.path.normpath(launcher_path))
-    for index, token in enumerate(argv[:-1]):
-        normalized_token = os.path.realpath(os.path.normpath(token))
-        if normalized_token == expected_launcher and argv[index + 1] == 'studio':
-            return True
-    return False
+    expected_executable = os.path.realpath(os.path.normpath(interpreter_path))
+    actual_executable = os.path.realpath(os.path.normpath(executable))
+    return (
+        actual_executable == expected_executable
+        and len(argv) >= 3
+        and argv[0] == interpreter_path
+        and argv[1] == launcher_path
+        and argv[2] == 'studio'
+    )
 
 
 def _index_listeners(listeners: Iterable[ListenerRecord]) -> dict[int, set[tuple[str, int]]]:
