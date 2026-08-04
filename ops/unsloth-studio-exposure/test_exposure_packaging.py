@@ -132,6 +132,9 @@ class PackagingSurfaceTests(unittest.TestCase):
         self,
         *,
         units_preexisting,
+        preflight_only=False,
+        route_helper_location='runtime',
+        route_helper_mode=0o755,
         guard_listener_host='127.0.0.1',
         guard_listener_pid='101',
         guard_listener_metadata=True,
@@ -250,13 +253,17 @@ fi
 ''')
             fake_ss.chmod(0o755)
 
-            route_helper = runtime_root / 'tailscale_route_state.py'
+            route_helper = (
+                temp_root / 'tailscale_route_state.py'
+                if route_helper_location == 'source'
+                else runtime_root / 'tailscale_route_state.py'
+            )
             route_helper.write_text(
                 '#!/usr/bin/env python3\n'
                 'import sys\n'
                 "raise SystemExit(1 if sys.argv[1] == 'ensure' else 0)\n"
             )
-            route_helper.chmod(0o755)
+            route_helper.chmod(route_helper_mode)
 
             safe_start = temp_root / 'start_exposure.sh'
             safe_start.write_text(
@@ -267,22 +274,27 @@ fi
             env = os.environ.copy()
             env['PATH'] = f'{fake_bin}:{env["PATH"]}'
             env['DGX_UNSLOTH_EXPOSURE_SYSTEMCTL_BIN'] = str(fake_systemctl)
+            start_argv = [
+                str(safe_start),
+                *(['--preflight-only'] if preflight_only else []),
+                '--state-file', str(state_file),
+                '--evidence-dir', str(evidence_dir),
+                '--runtime-root', str(runtime_root),
+                '--user-unit-root', str(unit_root),
+                '--lan-address', LAN_ADDRESS,
+                '--guard-target', f'127.0.0.1:{guard_probe_port}',
+            ]
             result = subprocess.run(
-                [
-                    str(safe_start),
-                    '--state-file', str(state_file),
-                    '--evidence-dir', str(evidence_dir),
-                    '--runtime-root', str(runtime_root),
-                    '--user-unit-root', str(unit_root),
-                    '--lan-address', LAN_ADDRESS,
-                    '--guard-target', f'127.0.0.1:{guard_probe_port}',
-                ],
+                start_argv,
                 capture_output=True,
                 text=True,
                 env=env,
                 check=False,
             )
-            calls = systemctl_log.read_text().splitlines()
+            calls = (
+                systemctl_log.read_text().splitlines()
+                if systemctl_log.exists() else []
+            )
             active_units = sorted(path.name for path in active_root.iterdir())
             return result, calls, active_units
 
@@ -555,6 +567,20 @@ fi
         self.assertIn('0.0.0.0', text)
         self.assertIn('[::]', text)
         self.assertIn('*', text)
+
+    def test_preflight_accepts_mode_0644_route_helper_from_explicit_paths(self):
+        for location in ('source', 'runtime'):
+            with self.subTest(location=location):
+                result, calls, active_units = self.run_start_with_fake_host(
+                    units_preexisting=False,
+                    preflight_only=True,
+                    route_helper_location=location,
+                    route_helper_mode=0o644,
+                )
+
+                self.assertEqual(0, result.returncode, result.stderr)
+                self.assertFalse(any(' start ' in f' {call} ' for call in calls))
+                self.assertEqual([], active_units)
 
     def test_remove_script_falls_back_to_source_tree_route_helper_for_repeat_safe_remove(self):
         text = REMOVE_SCRIPT.read_text()

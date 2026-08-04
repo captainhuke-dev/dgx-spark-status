@@ -125,12 +125,12 @@ PY
 
 resolve_route_helper() {
   local route_helper="${RUNTIME_ROOT}/tailscale_route_state.py"
-  if [[ -x "${route_helper}" ]]; then
+  if [[ -f "${route_helper}" ]]; then
     printf '%s\n' "${route_helper}"
     return 0
   fi
   route_helper="${SCRIPT_DIR}/tailscale_route_state.py"
-  if [[ -x "${route_helper}" ]]; then
+  if [[ -f "${route_helper}" ]]; then
     printf '%s\n' "${route_helper}"
     return 0
   fi
