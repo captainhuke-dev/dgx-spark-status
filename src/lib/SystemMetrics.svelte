@@ -3,7 +3,7 @@
   import { subscribe, getCurrentMetrics, isWebSocketConnected } from './websocket.js';
   import Gauge from './Gauge.svelte';
   import HermesSpotlight from './HermesSpotlight.svelte';
-  import { modelBudgetLabel } from '../../model-card-display.js';
+  import { modelBudgetLabel, modelIdValue } from '../../model-card-display.js';
   import { buildMemoryDisplay } from '../../memory-display.js';
   import { findModelControlProfile } from '../../model-control-matching.js';
   import { isActiveControlStatus, modelControlStatusLabel, resolveModelDisplayStatus } from '../../model-control-state.js';
@@ -352,10 +352,6 @@
 
   function displayModelName(model) {
     return model?.displayName || model?.modelName || model?.name || model?.key || model?.id || 'unknown model';
-  }
-
-  function displayModelId(model) {
-    return model?.apiModel || model?.servedModelName || model?.modelAlias || model?.name || model?.key || '';
   }
 
   function modelFunctionLabel(model, fallbackRuntime) {
@@ -732,8 +728,11 @@
                   <div class="model-header-row">
                     <div class="model-title-wrap">
                       <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
-                      {#if displayModelId(model) && displayModelId(model) !== displayModelName(model)}
-                        <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
+                      {#if modelIdValue(model)}
+                        <div class="model-id-row">
+                          <span class="model-id-label">Model ID</span>
+                          <span class="model-id-value" title={modelIdValue(model)}>{modelIdValue(model)}</span>
+                        </div>
                       {/if}
                     </div>
 	                    {#if isRunning}<span class="running-badge" class:degraded-badge={effectiveStatus === 'degraded_resident'}>{modelControlStatusLabel(effectiveStatus)}{#if displayPort} (:{displayPort}){/if}</span>{/if}
@@ -810,8 +809,11 @@
                   <div class="model-header-row">
                     <div class="model-title-wrap">
                       <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
-                      {#if displayModelId(model) && displayModelId(model) !== displayModelName(model)}
-                        <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
+                      {#if modelIdValue(model)}
+                        <div class="model-id-row">
+                          <span class="model-id-label">Model ID</span>
+                          <span class="model-id-value" title={modelIdValue(model)}>{modelIdValue(model)}</span>
+                        </div>
                       {/if}
                     </div>
                     {#if isRunning}<span class="running-badge" class:degraded-badge={effectiveStatus === 'degraded_resident'}>{modelControlStatusLabel(effectiveStatus)}{#if displayPort} :{displayPort}{/if}</span>{/if}
@@ -885,8 +887,11 @@
                   <div class="model-header-row">
                     <div class="model-title-wrap">
                       <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
-                      {#if displayModelId(model) && displayModelId(model) !== displayModelName(model)}
-                        <div class="model-id" title={displayModelId(model)}>{displayModelId(model)}</div>
+                      {#if modelIdValue(model)}
+                        <div class="model-id-row">
+                          <span class="model-id-label">Model ID</span>
+                          <span class="model-id-value" title={modelIdValue(model)}>{modelIdValue(model)}</span>
+                        </div>
                       {/if}
                     </div>
                       {#if isDs4Model(model)}
@@ -1547,13 +1552,32 @@
     line-height: 1.25;
   }
 
-  .model-id {
+  .model-id-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.3rem;
+    margin-top: 0.16rem;
+    min-width: 0;
+  }
+
+  .model-id-label {
+    color: #9aa096;
+    font-size: 0.54rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  .model-id-value {
     color: #777;
     font-size: 0.58rem;
     font-family: 'Monaco', 'Menlo', monospace;
     line-height: 1.25;
-    margin-top: 0.12rem;
-    overflow-wrap: anywhere;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .model-function {
