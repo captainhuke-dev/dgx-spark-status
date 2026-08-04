@@ -10,6 +10,8 @@ function normalizedPath(value) {
 
 export const UNSLOTH_STUDIO_ROOT = '/home/mctdgx01/apps/unsloth-studio';
 export const UNSLOTH_STUDIO_LLAMA_SERVER = `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server`;
+export const UNSLOTH_STUDIO_INTERPRETER = `${UNSLOTH_STUDIO_ROOT}/unsloth_studio/bin/python`;
+export const UNSLOTH_STUDIO_LAUNCHER = `${UNSLOTH_STUDIO_ROOT}/bin/unsloth`;
 export const UNSLOTH_STUDIO_CLIENT_PORT = 56827;
 
 function numericPort(value) {
@@ -27,7 +29,9 @@ function installedStudioExecutable(realpath) {
 
 export function isUnslothStudioProcess(process = {}, { realpath = realpathSync } = {}) {
   const executable = String(process.executable || '').trim();
-  return executable !== '' && executable === installedStudioExecutable(realpath);
+  return process.studioLauncherAncestryVerified === true &&
+    executable !== '' &&
+    executable === installedStudioExecutable(realpath);
 }
 
 export function clientPortForLlamaProcess(process = {}) {
@@ -63,11 +67,12 @@ export function modelMatchesRunningLlamaProcess(model = {}, process = {}) {
     processPath.startsWith(`${configuredPath}/`);
 }
 
-function processInventoryItem(process, { status, sizeGB, apiModel } = {}) {
+function processInventoryItem(process, { status, sizeGB, apiModel, studioRuntimeResolved } = {}) {
   const resolvedStatus = status || 'running';
   const resolvedModel = String(apiModel || '').trim() || null;
-  const clientPort = clientPortForLlamaProcess(process);
-  const backendPort = backendPortForLlamaProcess(process);
+  const studioIdentityUnavailable = isUnslothStudioProcess(process) && studioRuntimeResolved === false;
+  const clientPort = studioIdentityUnavailable ? null : clientPortForLlamaProcess(process);
+  const backendPort = studioIdentityUnavailable ? null : backendPortForLlamaProcess(process);
   const displayPort = clientPort || backendPort;
   return {
     key: process.alias || process.label,
@@ -112,12 +117,16 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
   const configured = next.llama[index];
   const status = details.status || 'running';
   const studioProcess = isUnslothStudioProcess(process);
+  const studioRuntimeResolved = !studioProcess || details.studioRuntimeResolved !== false;
   const processClientPort = clientPortForLlamaProcess(process);
   const processBackendPort = backendPortForLlamaProcess(process);
-  const clientPort = studioProcess
+  const clientPort = !studioRuntimeResolved
+    ? null
+    : studioProcess
     ? processClientPort || processBackendPort
     : numericPort(configured.clientPort || configured.port) || processClientPort || processBackendPort;
-  const displayPort = clientPort || processBackendPort;
+  const backendPort = studioRuntimeResolved ? processBackendPort : null;
+  const displayPort = studioRuntimeResolved ? clientPort || backendPort : null;
   const liveApiModel = String(details.apiModel || '').trim() || null;
   next.llama[index] = {
     ...configured,
@@ -126,7 +135,7 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     running: status === 'running',
     port: displayPort,
     clientPort,
-    backendPort: processBackendPort,
+    backendPort,
     host: configured.host || '127.0.0.1',
     path: configured.path || process.modelPath,
     modelPath: configured.modelPath || process.modelPath,

@@ -84,7 +84,7 @@ require_lan_address() {
   fi
 }
 
-listener_pids() {
+listener_records() {
   local host="$1"
   local port="$2"
   python3 - "$host" "$port" <<'PY'
@@ -107,12 +107,18 @@ for line in result.stdout.splitlines():
         f':::${port}'.replace('$', ''),
         f'*:{port}',
     }
-    if local in {f'{host}:{port}', f'[{host}]:{port}'} | wildcard_locals:
-        pids = re.findall(r'pid=(\d+)', line)
-        if pids:
-            matches.extend(pids)
-        else:
-            matches.append('PID_METADATA_UNAVAILABLE')
+    exact_locals = {f'{host}:{port}', f'[{host}]:{port}'}
+    if local in exact_locals:
+        listener_kind = 'EXACT'
+    elif local in wildcard_locals:
+        listener_kind = 'WILDCARD'
+    else:
+        continue
+    pids = re.findall(r'pid=(\d+)', line)
+    if pids:
+        matches.extend(f'{listener_kind}:{pid}' for pid in pids)
+    else:
+        matches.append(f'{listener_kind}:PID_METADATA_UNAVAILABLE')
 print('\n'.join(matches))
 PY
 }
@@ -137,29 +143,44 @@ assert_listener_available_or_owned() {
   local unit_name="$3"
   local main_pid
   main_pid="$(systemctl_user show --property MainPID --value "${unit_name}" 2>/dev/null || true)"
-  local active_pids
-  active_pids="$(listener_pids "${host}" "${port}")"
-  if [[ -z "${active_pids}" ]]; then
+  local active_records
+  active_records="$(listener_records "${host}" "${port}")"
+  if [[ -z "${active_records}" ]]; then
     return 0
   fi
-  if [[ -n "${main_pid}" && "${main_pid}" != "0" ]]; then
-    local pid
-    while IFS= read -r pid; do
-      if [[ -n "${pid}" && "${pid}" != "${main_pid}" ]]; then
-        echo "refusing occupied unowned listener ${host}:${port} for ${unit_name}" >&2
-        exit 1
-      fi
-    done <<< "${active_pids}"
-    return 0
-  fi
-  echo "refusing occupied unowned listener ${host}:${port} for ${unit_name}" >&2
-  exit 1
+  local record
+  while IFS= read -r record; do
+    [[ -z "${record}" ]] && continue
+    if [[ "${record}" == WILDCARD:* ]]; then
+      echo "refusing wildcard listener on required port ${port} for ${unit_name}" >&2
+      exit 1
+    fi
+    local pid="${record#EXACT:}"
+    if [[ -z "${main_pid}" || "${main_pid}" == "0" || "${pid}" != "${main_pid}" ]]; then
+      echo "refusing occupied unowned listener ${host}:${port} for ${unit_name}" >&2
+      exit 1
+    fi
+  done <<< "${active_records}"
 }
 
 assert_listener_present() {
   local host="$1"
   local port="$2"
-  if [[ -z "$(listener_pids "${host}" "${port}")" ]]; then
+  local active_records
+  active_records="$(listener_records "${host}" "${port}")"
+  local exact_present="0"
+  local record
+  while IFS= read -r record; do
+    [[ -z "${record}" ]] && continue
+    if [[ "${record}" == WILDCARD:* ]]; then
+      echo "refusing wildcard listener on required port ${port}; exact listener ${host}:${port} is required" >&2
+      exit 1
+    fi
+    if [[ "${record}" == EXACT:* ]]; then
+      exact_present="1"
+    fi
+  done <<< "${active_records}"
+  if [[ "${exact_present}" != "1" ]]; then
     echo "expected listener ${host}:${port} was not present" >&2
     exit 1
   fi

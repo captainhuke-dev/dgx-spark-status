@@ -260,12 +260,7 @@ def _state_claims_route_ownership(state: dict[str, str]) -> bool:
     )
     if not targets_expected_route or state.get('ROUTE_REMOVED', '0') == '1':
         return False
-    if state.get('ROUTE_CREATED') == '1':
-        return True
-    return (
-        state.get('ROUTE_PENDING') == '1'
-        and state.get('ROUTE_PREEXISTING') == '0'
-    )
+    return state.get('ROUTE_CREATED') == '1'
 
 
 def _record_route_state(
@@ -407,8 +402,18 @@ def main(argv: list[str] | None = None) -> int:
         except BaseException as exc:
             try:
                 _compensate_created_route(runner)
+                _record_route_state(
+                    state_file,
+                    created=False,
+                    preexisting=False,
+                    pending=False,
+                    removed=True,
+                )
             except BaseException as compensation_error:
-                exc.add_note(f'Exact route compensation also failed: {compensation_error}')
+                exc.add_note(
+                    'Exact route compensation or compensated-state persistence '
+                    f'also failed: {compensation_error}'
+                )
                 raise exc from compensation_error
             raise
         return 0
@@ -420,12 +425,25 @@ def main(argv: list[str] | None = None) -> int:
         runner=runner,
         route_created=route_created,
     )
+    route_removed = state.get('ROUTE_REMOVED', '0') == '1'
+    if route_created:
+        verified_document = (
+            _capture_evidence(evidence_dir)
+            if classification.status == 'matching'
+            else serve_document
+        )
+        verified = classify_tcp_route(verified_document)
+        if verified.status != 'absent':
+            raise RouteConflict(
+                f'Removed TCP {ROUTE_PORT} route was not verified absent.'
+            )
+        route_removed = True
     _record_route_state(
         state_file,
         created=route_created,
         preexisting=state.get('ROUTE_PREEXISTING', '0') == '1',
         pending=False,
-        removed=route_created and classification.status in {'absent', 'matching'},
+        removed=route_removed,
     )
     return 0
 

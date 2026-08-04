@@ -111,10 +111,20 @@ class BackendResolver:
         inspector: RealInspector | None = None,
         *,
         studio_root: str = UNSLOTH_STUDIO_ROOT,
-        time_fn=time.time,
+        time_fn=None,
         cache_ttl_seconds: float = 2.0,
         probe_timeout_seconds: float = 2.0,
     ):
+        try:
+            validated_cache_ttl = float(cache_ttl_seconds)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                'cache_ttl_seconds must be greater than 0 and at most 2.'
+            ) from exc
+        if not 0 < validated_cache_ttl <= 2:
+            raise ValueError(
+                'cache_ttl_seconds must be greater than 0 and at most 2.'
+            )
         self._inspector = inspector or RealInspector()
         self._studio_root = studio_root.rstrip('/')
         self._studio_llama_server = f'{self._studio_root}/llama.cpp/llama-server'
@@ -122,8 +132,8 @@ class BackendResolver:
             f'{self._studio_root}/unsloth_studio/bin/python'
         )
         self._studio_launcher = f'{self._studio_root}/bin/unsloth'
-        self._time_fn = time_fn
-        self._cache_ttl_seconds = cache_ttl_seconds
+        self._time_fn = time.monotonic if time_fn is None else time_fn
+        self._cache_ttl_seconds = validated_cache_ttl
         self._probe_timeout_seconds = probe_timeout_seconds
         self._cached_backend: ResolvedBackend | None = None
 

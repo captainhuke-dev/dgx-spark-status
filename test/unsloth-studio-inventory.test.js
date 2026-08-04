@@ -4,16 +4,20 @@ import test from 'node:test';
 
 import {
   UNSLOTH_STUDIO_CLIENT_PORT,
+  UNSLOTH_STUDIO_INTERPRETER,
+  UNSLOTH_STUDIO_LAUNCHER,
   UNSLOTH_STUDIO_ROOT,
   clientPortForLlamaProcess,
   isUnslothStudioProcess,
 } from '../runtime-model-inventory.js';
 import {
   parseRunningLlamaProcessLine,
+  readProcessRecord,
   selectedLlamaPorts,
 } from '../llama-process-inventory.js';
 import {
   configuredLlamaCandidateMatchesProcess,
+  liveModelForLlamaProcess,
 } from '../dev-server.js';
 
 const STUDIO_LLAMA_SERVER = `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server`;
@@ -26,10 +30,18 @@ function installedStudioExecutable() {
   }
 }
 
-test('identifies only the exact installed Studio llama-server path as Unsloth Studio', () => {
+test('requires verified Studio launcher ancestry in addition to the exact installed llama-server', () => {
   assert.equal(
     isUnslothStudioProcess({
       executable: installedStudioExecutable(),
+      command: '/forged/argv0 --port 36321',
+    }),
+    false,
+  );
+  assert.equal(
+    isUnslothStudioProcess({
+      executable: installedStudioExecutable(),
+      studioLauncherAncestryVerified: true,
       command: '/forged/argv0 --port 36321',
     }),
     true,
@@ -55,6 +67,7 @@ test('uses an exact installed-path fallback only when Studio realpath is unavail
     isUnslothStudioProcess(
       {
         executable: STUDIO_LLAMA_SERVER,
+        studioLauncherAncestryVerified: true,
         command: '/forged/argv0 --port 36321',
       },
       {
@@ -77,7 +90,14 @@ test('rejects a non-Studio executable that only mentions the Studio launcher in 
 
   const process = parseRunningLlamaProcessLine(
     `716620 716100 Tue Aug  4 09:14:12 2026 ${spoofedCommand}`,
-    { readExecutable: () => '/opt/llama.cpp/llama-server' },
+    {
+      readProcess: () => ({
+        pid: 716620,
+        ppid: 1,
+        executable: '/opt/llama.cpp/llama-server',
+        argv: ['/opt/llama.cpp/llama-server', '--port', '36321'],
+      }),
+    },
   );
   assert.equal(process.executable, '/opt/llama.cpp/llama-server');
   assert.equal(process.isUnslothStudio, false);
@@ -87,7 +107,14 @@ test('rejects a non-Studio executable that only mentions the Studio launcher in 
 test('forged argv0 cannot classify a non-Studio proc executable as Studio', () => {
   const process = parseRunningLlamaProcessLine(
     `716621 716100 Tue Aug  4 09:14:12 2026 ${STUDIO_LLAMA_SERVER} --port 36321`,
-    { readExecutable: () => '/usr/bin/sleep' },
+    {
+      readProcess: () => ({
+        pid: 716621,
+        ppid: 1,
+        executable: '/usr/bin/sleep',
+        argv: ['/usr/bin/sleep'],
+      }),
+    },
   );
 
   assert.equal(process.executable, '/usr/bin/sleep');
@@ -98,7 +125,7 @@ test('forged argv0 cannot classify a non-Studio proc executable as Studio', () =
 test('unavailable proc executable identity fails closed', () => {
   const process = parseRunningLlamaProcessLine(
     `716622 716100 Tue Aug  4 09:14:12 2026 ${STUDIO_LLAMA_SERVER} --port 36321`,
-    { readExecutable: () => null },
+    { readProcess: () => null },
   );
 
   assert.equal(process.executable, null);
@@ -110,6 +137,7 @@ test('maps Studio processes to the fixed client port while leaving other llama p
   assert.equal(
     clientPortForLlamaProcess({
       executable: installedStudioExecutable(),
+      studioLauncherAncestryVerified: true,
       command: `${STUDIO_LLAMA_SERVER} --port 36321`,
       port: 36321,
     }),
@@ -124,10 +152,45 @@ test('maps Studio processes to the fixed client port while leaving other llama p
   );
 });
 
-test('parses ps output rows with process identity, backend port, and Studio client port metadata', () => {
+test('reads executable, parent PID, and argv from proc records', () => {
+  const process = readProcessRecord(716619, {
+    readFile: path => path.endsWith('/stat')
+      ? '716619 (llama server) S 716100 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 24680 0 0'
+      : Buffer.from([STUDIO_LLAMA_SERVER, '--port', '36321', ''].join('\0')),
+    realpath: () => installedStudioExecutable(),
+  });
+
+  assert.deepEqual(process, {
+    pid: 716619,
+    ppid: 716100,
+    executable: installedStudioExecutable(),
+    argv: [STUDIO_LLAMA_SERVER, '--port', '36321'],
+  });
+});
+
+test('parses only an exact Studio launcher ancestor as verified Studio identity', () => {
+  const records = new Map([
+    [716619, {
+      pid: 716619,
+      ppid: 716100,
+      executable: installedStudioExecutable(),
+      argv: [STUDIO_LLAMA_SERVER, '--port', '36321'],
+    }],
+    [716100, {
+      pid: 716100,
+      ppid: 1,
+      executable: '/usr/bin/python3.12',
+      argv: [UNSLOTH_STUDIO_INTERPRETER, UNSLOTH_STUDIO_LAUNCHER, 'studio'],
+    }],
+  ]);
   const process = parseRunningLlamaProcessLine(
     `716619 716100 Tue Aug  4 09:14:12 2026 ${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36321 --model /models/deepseek/model.gguf --alias unsloth/DeepSeek-V4-Flash-0731-GGUF --ctx-size 278528`,
-    { readExecutable: () => installedStudioExecutable() },
+    {
+      readProcess: pid => records.get(pid) || null,
+      realpath: path => path === UNSLOTH_STUDIO_INTERPRETER
+        ? '/usr/bin/python3.12'
+        : installedStudioExecutable(),
+    },
   );
 
   assert.equal(process.pid, 716619);
@@ -139,7 +202,35 @@ test('parses ps output rows with process identity, backend port, and Studio clie
   assert.equal(process.alias, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(process.context, 278528);
   assert.equal(process.modelPath, '/models/deepseek/model.gguf');
+  assert.equal(process.studioLauncherAncestryVerified, true);
   assert.equal(process.isUnslothStudio, true);
+});
+
+test('does not classify a manually launched exact Studio binary with a non-Studio parent', () => {
+  const records = new Map([
+    [716619, {
+      pid: 716619,
+      ppid: 716100,
+      executable: installedStudioExecutable(),
+      argv: [STUDIO_LLAMA_SERVER, '--port', '36321'],
+    }],
+    [716100, {
+      pid: 716100,
+      ppid: 1,
+      executable: '/usr/bin/bash',
+      argv: ['/usr/bin/bash', '/tmp/manual-launch.sh'],
+    }],
+  ]);
+
+  const process = parseRunningLlamaProcessLine(
+    `716619 716100 Tue Aug  4 09:14:12 2026 ${STUDIO_LLAMA_SERVER} --port 36321`,
+    { readProcess: pid => records.get(pid) || null },
+  );
+
+  assert.equal(process.executable, installedStudioExecutable());
+  assert.equal(process.studioLauncherAncestryVerified, false);
+  assert.equal(process.isUnslothStudio, false);
+  assert.equal(process.clientPort, 36321);
 });
 
 test('keeps diagnostics on the backend port while exposing the Studio client port as proxyPort', () => {
@@ -189,6 +280,7 @@ test('matches the configured Studio card by process identity before the shared c
   ];
   const betaProcess = {
     executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
     command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36322`,
     clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
     port: 36322,
@@ -221,6 +313,7 @@ test('does not choose a Studio card solely from a shared client port when identi
   ];
   const unknownProcess = {
     executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
     command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36323`,
     clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
     port: 36323,
@@ -245,6 +338,7 @@ test('does not accept a reused PID when the configured Studio start time differs
   };
   const reusedProcess = {
     executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
     command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36324`,
     clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
     port: 36324,
@@ -257,4 +351,20 @@ test('does not accept a reused PID when the configured Studio start time differs
     configuredLlamaCandidateMatchesProcess(candidate, reusedProcess, [candidate]),
     false,
   );
+});
+
+test('Dashboard probes reject multiple distinct live IDs only for verified Studio processes', () => {
+  const payload = {
+    data: [
+      { id: 'unsloth/Studio-Alpha' },
+      { id: 'unsloth/Studio-Beta' },
+    ],
+  };
+  const studioProcess = {
+    executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
+  };
+
+  assert.equal(liveModelForLlamaProcess(payload, studioProcess), null);
+  assert.equal(liveModelForLlamaProcess(payload, {})?.id, 'unsloth/Studio-Alpha');
 });

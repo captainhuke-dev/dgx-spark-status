@@ -71,6 +71,7 @@ test('prefers a live probed apiModel over stale configured metadata while keepin
     context: 278528,
     label: 'DeepSeek V4 Flash 0731 Unsloth UD-IQ3_XXS',
     executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
     command: '/home/mctdgx01/apps/unsloth-studio/llama.cpp/llama-server --port 36321'
   }, { status: 'running', apiModel: 'unsloth/DeepSeek-V4-Flash-0731-GGUF' });
 
@@ -117,6 +118,7 @@ test('creates a Studio inventory item with separate backend and client ports plu
     context: 278528,
     label: 'DeepSeek V4 Flash 0731',
     executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
     command: '/home/mctdgx01/apps/unsloth-studio/llama.cpp/llama-server --port 36321'
   }, { status: 'running', apiModel: 'unsloth/DeepSeek-V4-Flash-0731-GGUF' });
 
@@ -127,6 +129,62 @@ test('creates a Studio inventory item with separate backend and client ports plu
   assert.equal(merged.llama[0].apiModel, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(merged.llama[0].servedModelName, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(merged.llama[0].connectionLabel, 'llama-server · :56827 · ctx 272K');
+});
+
+test('clears Studio API, running, backend, and client fields when runtime identity is ambiguous', () => {
+  const merged = mergeRunningLlamaProcess({
+    llama: [{
+      apiModel: 'stale-configured-id',
+      servedModelName: 'stale-configured-id',
+      modelPath: '/models/deepseek',
+      port: UNSLOTH_STUDIO_CLIENT_PORT,
+      clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+      backendPort: 36320,
+      status: 'running',
+      running: true,
+    }],
+    vllm: [],
+  }, {
+    port: 36321,
+    alias: 'process-alias',
+    modelPath: '/models/deepseek/model.gguf',
+    context: 278528,
+    label: 'DeepSeek',
+    executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
+  }, {
+    status: 'loading',
+    apiModel: null,
+    studioRuntimeResolved: false,
+  });
+
+  assert.equal(merged.llama[0].apiModel, null);
+  assert.equal(merged.llama[0].servedModelName, null);
+  assert.equal(merged.llama[0].running, false);
+  assert.equal(merged.llama[0].port, null);
+  assert.equal(merged.llama[0].clientPort, null);
+  assert.equal(merged.llama[0].backendPort, null);
+});
+
+test('does not expose ports for an unmatched Studio process with unavailable live identity', () => {
+  const merged = mergeRunningLlamaProcess({ llama: [], vllm: [] }, {
+    port: 36321,
+    alias: 'process-alias',
+    modelPath: '/models/deepseek/model.gguf',
+    context: 278528,
+    label: 'DeepSeek',
+    executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
+  }, {
+    status: 'loading',
+    apiModel: null,
+    studioRuntimeResolved: false,
+  });
+
+  assert.equal(merged.llama[0].running, false);
+  assert.equal(merged.llama[0].port, null);
+  assert.equal(merged.llama[0].clientPort, null);
+  assert.equal(merged.llama[0].backendPort, null);
 });
 
 test('keeps an unrelated running llama process as a separate inventory item', () => {

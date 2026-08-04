@@ -93,7 +93,12 @@ class CallbackRunner(RecordingRunner):
 
 
 class PackagingSurfaceTests(unittest.TestCase):
-    def run_start_with_fake_host(self, *, units_preexisting):
+    def run_start_with_fake_host(
+        self,
+        *,
+        units_preexisting,
+        guard_listener_host='127.0.0.1',
+    ):
         with tempfile.TemporaryDirectory() as temp_root_text:
             temp_root = pathlib.Path(temp_root_text)
             fake_bin = temp_root / 'bin'
@@ -150,7 +155,7 @@ esac
             fake_ss = fake_bin / 'ss'
             fake_ss.write_text(f'''#!/usr/bin/env bash
 if [[ -f "{active_root}/dgx-unsloth-guard.service" ]]; then
-  printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:(("python3",pid=101,fd=3))\\n'
+  printf 'LISTEN 0 128 {guard_listener_host}:56828 0.0.0.0:* users:(("python3",pid=101,fd=3))\\n'
 fi
 if [[ -f "{active_root}/dgx-unsloth-lan-proxy.service" ]]; then
   printf 'LISTEN 0 128 192.168.0.21:56827 0.0.0.0:* users:(("socat",pid=102,fd=3))\\n'
@@ -413,6 +418,37 @@ fi
         self.assertIn('--user stop dgx-unsloth-lan-proxy.service', calls)
         self.assertEqual([], active_units)
 
+    def test_start_preflight_rejects_wildcard_listener_owned_by_expected_unit(self):
+        for wildcard_host in ('0.0.0.0', '[::]', '*'):
+            with self.subTest(wildcard_host=wildcard_host):
+                result, calls, active_units = self.run_start_with_fake_host(
+                    units_preexisting=True,
+                    guard_listener_host=wildcard_host,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn('wildcard listener', result.stderr)
+                self.assertNotIn('--user start dgx-unsloth-guard.service', calls)
+                self.assertNotIn('--user start dgx-unsloth-lan-proxy.service', calls)
+                self.assertEqual(
+                    ['dgx-unsloth-guard.service', 'dgx-unsloth-lan-proxy.service'],
+                    active_units,
+                )
+
+    def test_listener_presence_rejects_wildcard_after_expected_unit_starts(self):
+        result, calls, active_units = self.run_start_with_fake_host(
+            units_preexisting=False,
+            guard_listener_host='0.0.0.0',
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('wildcard listener', result.stderr)
+        self.assertIn('exact listener 127.0.0.1:56828 is required', result.stderr)
+        self.assertIn('--user start dgx-unsloth-guard.service', calls)
+        self.assertNotIn('--user start dgx-unsloth-lan-proxy.service', calls)
+        self.assertIn('--user stop dgx-unsloth-guard.service', calls)
+        self.assertEqual([], active_units)
+
     def test_install_route_conflict_preflight_does_not_mutate_files_or_enablement(self):
         results, runtime_exists, units_exist, calls = self.run_install_with_fake_preflight(
             route_conflict=True,
@@ -634,8 +670,10 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 runner.calls,
             )
             state = route_state._read_state(state_file)
-            self.assertEqual('1', state['ROUTE_PENDING'])
+            self.assertEqual('0', state['ROUTE_PENDING'])
             self.assertEqual('0', state['ROUTE_CREATED'])
+            self.assertEqual('0', state['ROUTE_PREEXISTING'])
+            self.assertEqual('1', state['ROUTE_REMOVED'])
 
     def test_post_mutation_verification_failure_compensates_exact_created_route(self):
         route_state = load_route_state_module()
@@ -667,6 +705,53 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 ],
                 runner.calls,
             )
+            state = route_state._read_state(state_file)
+            self.assertEqual('0', state['ROUTE_PENDING'])
+            self.assertEqual('0', state['ROUTE_CREATED'])
+            self.assertEqual('0', state['ROUTE_PREEXISTING'])
+            self.assertEqual('1', state['ROUTE_REMOVED'])
+
+    def test_compensated_pending_state_never_owns_a_later_inherited_matching_route(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        absent = self.serve_status()
+        inherited = self.serve_status()
+        inherited['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[absent, absent, inherited],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                with self.assertRaises(route_state.RouteConflict):
+                    route_state.main([
+                        'ensure', '--state-file', str(state_file),
+                        '--evidence-dir', str(evidence_dir),
+                    ])
+                route_state.main([
+                    'remove', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+
+            self.assertEqual(
+                [
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', GUARD_TARGET],
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', 'off'],
+                ],
+                runner.calls,
+            )
+            state = route_state._read_state(state_file)
+            self.assertEqual('0', state['ROUTE_PENDING'])
+            self.assertEqual('0', state['ROUTE_CREATED'])
+            self.assertEqual('0', state['ROUTE_PREEXISTING'])
+            self.assertEqual('1', state['ROUTE_REMOVED'])
 
     def test_repeated_ensure_preserves_created_route_ownership_for_remove(self):
         route_state = load_route_state_module()
@@ -683,7 +768,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, matching, matching, matching],
+                    side_effect=[absent, matching, matching, matching, absent],
                 ),
                 mock.patch.object(
                     route_state,
@@ -715,6 +800,44 @@ class TailscaleRouteStateTests(unittest.TestCase):
             self.assertEqual('1', state['ROUTE_CREATED'])
             self.assertEqual('0', state['ROUTE_PREEXISTING'])
             self.assertEqual('1', state['ROUTE_REMOVED'])
+
+    def test_remove_verifies_route_absence_before_recording_removed(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            route_state._record_route_state(
+                state_file,
+                created=True,
+                preexisting=False,
+                pending=False,
+            )
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[matching, matching],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                with self.assertRaises(route_state.RouteConflict):
+                    route_state.main([
+                        'remove', '--state-file', str(state_file),
+                        '--evidence-dir', str(evidence_dir),
+                    ])
+
+            self.assertEqual(
+                [['tailscale', 'serve', '--bg', '--tcp=56827', 'off']],
+                runner.calls,
+            )
+            state = route_state._read_state(state_file)
+            self.assertEqual('1', state['ROUTE_CREATED'])
+            self.assertEqual('0', state['ROUTE_REMOVED'])
 
     def test_matching_preexisting_route_is_not_claimed_or_removed(self):
         route_state = load_route_state_module()

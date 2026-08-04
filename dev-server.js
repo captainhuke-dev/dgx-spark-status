@@ -15,12 +15,16 @@ import { readModelRuntimeDetails } from './model-runtime-details.js';
 import { classifyInventoryConfig } from './model-inventory-section.js';
 import { parseRunningLlamaProcessLine, selectedLlamaPorts } from './llama-process-inventory.js';
 import {
+  UNSLOTH_STUDIO_CLIENT_PORT,
   clientPortForLlamaProcess,
   isUnslothStudioProcess,
   mergeRunningLlamaProcess,
   modelMatchesRunningLlamaProcess
 } from './runtime-model-inventory.js';
-import { selectPreferredLlamaRuntime } from './llama-runtime-selection.js';
+import {
+  selectLiveModelFromProbe,
+  selectPreferredLlamaRuntime,
+} from './llama-runtime-selection.js';
 import { classifyManagedStatus, DEGRADED_RESIDENT_STATUS } from './model-control-state.js';
 import { readManagedProfileComponents } from './managed-profile-components.js';
 import { stopAllManagedModels } from './model-control-operations.js';
@@ -874,6 +878,12 @@ function modelApiLooksLikeLlama(data) {
     /\bgguf\b/.test(text);
 }
 
+export function liveModelForLlamaProcess(payload, process = {}) {
+  return selectLiveModelFromProbe(payload, {
+    requireSingleDistinctId: isUnslothStudioProcess(process),
+  });
+}
+
 function envContextLength(env) {
   const raw = env.CONTEXT_LENGTH || env.MAX_MODEL_LEN || env.CTX_SIZE;
   const parsed = raw ? parseInt(raw, 10) : null;
@@ -1641,14 +1651,19 @@ async function getAvailableModels() {
 
   try {
     const llamaProcesses = await getRunningLlamaProcesses();
+    const processProbeResults = [];
     for (const proc of llamaProcesses) {
-      const configuredModel = models.llama.find(model =>
+      const studioProcess = isUnslothStudioProcess(proc);
+      const configuredMatches = models.llama.filter(model =>
         Number(model.port || 0) === Number(proc.port) ||
         modelMatchesRunningLlamaProcess(model, proc)
       );
+      const configuredModel = studioProcess
+        ? (configuredMatches.length === 1 ? configuredMatches[0] : null)
+        : configuredMatches[0];
       const probe = await probeOpenAIModels(proc.port, configuredModel?.host || '127.0.0.1');
-      const status = probe.status === 'running' ? 'running' : 'loading';
-      const apiModel = probe.models?.[0]?.id || null;
+      const liveModel = liveModelForLlamaProcess({ data: probe.models }, proc);
+      const status = probe.status === 'running' && liveModel?.id ? 'running' : 'loading';
       let procSizeGB = null;
       if (proc.modelPath) {
         try {
@@ -1658,10 +1673,43 @@ async function getAvailableModels() {
         } catch (e) {}
       }
 
-      const merged = mergeRunningLlamaProcess(models, proc, {
+      processProbeResults.push({
+        process: proc,
         status,
         sizeGB: procSizeGB,
-        apiModel
+        candidate: {
+          source: 'process',
+          process: proc,
+          isUnslothStudio: studioProcess,
+          healthy: status === 'running',
+          liveApiModelId: String(liveModel?.id || '').trim(),
+          liveApiModelIds: (probe.models || [])
+            .map(model => String(model?.id || '').trim())
+            .filter(Boolean),
+          backendPort: proc.port,
+          clientPort: clientPortForLlamaProcess(proc),
+        },
+      });
+    }
+
+    const studioCandidates = processProbeResults
+      .map(result => result.candidate)
+      .filter(candidate => candidate.isUnslothStudio);
+    const selectedStudio = studioCandidates.length
+      ? selectPreferredLlamaRuntime({ liveProcessCandidates: studioCandidates })
+      : null;
+    const orderedProbeResults = processProbeResults
+      .filter(result => result.candidate !== selectedStudio)
+      .concat(processProbeResults.filter(result => result.candidate === selectedStudio));
+
+    for (const result of orderedProbeResults) {
+      const studioProcess = result.candidate.isUnslothStudio;
+      const studioRuntimeResolved = !studioProcess || result.candidate === selectedStudio;
+      const merged = mergeRunningLlamaProcess(models, result.process, {
+        status: studioRuntimeResolved ? result.status : 'loading',
+        sizeGB: result.sizeGB,
+        apiModel: studioRuntimeResolved ? result.candidate.liveApiModelId : null,
+        studioRuntimeResolved,
       });
       models.llama = merged.llama;
       models.vllm = merged.vllm;
@@ -1701,7 +1749,9 @@ async function getLlamaInfo() {
           probeHost,
           server,
           healthy: false,
+          isUnslothStudio: false,
           liveApiModelId: '',
+          liveApiModelIds: [],
           modelPath: env.MODEL_PATH || null
         };
         llamaConfigs.push(candidate);
@@ -1711,7 +1761,10 @@ async function getLlamaInfo() {
           const modelsRes = await fetch(`${server}/v1/models`, { signal: AbortSignal.timeout(1000) });
           if (!modelsRes.ok) continue;
           const data = await modelsRes.json();
-          const firstModel = data?.data?.[0] || null;
+          candidate.liveApiModelIds = (data?.data || [])
+            .map(model => String(model?.id || '').trim())
+            .filter(Boolean);
+          const firstModel = selectLiveModelFromProbe(data);
           if (firstModel?.id) {
             candidate.healthy = true;
             candidate.liveApiModelId = firstModel.id;
@@ -1726,10 +1779,12 @@ async function getLlamaInfo() {
         configuredLlamaCandidateMatchesProcess(candidate, proc, llamaConfigs)
       );
       const matchingConfig = matchingConfigs.length === 1 ? matchingConfigs[0] : null;
+      const studioProcess = isUnslothStudioProcess(proc);
+      if (studioProcess && matchingConfig) matchingConfig.isUnslothStudio = true;
       const probeHost = matchingConfig ? matchingConfig.probeHost : '127.0.0.1';
       const server = `http://${probeHost}:${proc.port}`;
       const processClientPort = clientPortForLlamaProcess(proc);
-      const clientPort = isUnslothStudioProcess(proc)
+      const clientPort = studioProcess
         ? processClientPort
         : numericPort(matchingConfig?.clientPort) || processClientPort;
       const candidate = {
@@ -1747,7 +1802,9 @@ async function getLlamaInfo() {
         probeHost,
         server,
         healthy: false,
+        isUnslothStudio: studioProcess,
         liveApiModelId: '',
+        liveApiModelIds: [],
         modelPath: proc.modelPath || matchingConfig?.modelPath || null
       };
       liveProcessCandidates.push(candidate);
@@ -1756,7 +1813,10 @@ async function getLlamaInfo() {
         const modelsRes = await fetch(`${server}/v1/models`, { signal: AbortSignal.timeout(1000) });
         if (!modelsRes.ok) continue;
         const data = await modelsRes.json();
-        const firstModel = data?.data?.[0] || null;
+        candidate.liveApiModelIds = (data?.data || [])
+          .map(model => String(model?.id || '').trim())
+          .filter(Boolean);
+        const firstModel = liveModelForLlamaProcess(data, proc);
         if (firstModel?.id && modelApiLooksLikeLlama(data)) {
           candidate.healthy = true;
           candidate.liveApiModelId = firstModel.id;
@@ -1773,10 +1833,20 @@ async function getLlamaInfo() {
       } catch (e) {}
     }
 
+    if (runningLlamaProcesses.some(isUnslothStudioProcess)) {
+      for (const candidate of configuredCandidates) {
+        if (numericPort(candidate.clientPort) === UNSLOTH_STUDIO_CLIENT_PORT) {
+          candidate.isUnslothStudio = true;
+        }
+      }
+    }
+
     const selectedRuntime = selectPreferredLlamaRuntime({
       configuredCandidates,
       liveProcessCandidates
     });
+    const studioRuntimeUnresolved = liveProcessCandidates.some(candidate => candidate.isUnslothStudio) &&
+      !selectedRuntime;
 
     if (selectedRuntime) {
       llamaPort = selectedLlamaPorts(selectedRuntime, selectedRuntime.port).port || llamaPort;
@@ -1787,11 +1857,17 @@ async function getLlamaInfo() {
       };
     }
 
-    const [healthRes, propsRes, slotsRes] = await Promise.allSettled([
-      fetch(`${llamaServer}/health`, { signal: AbortSignal.timeout(2000) }),
-      fetch(`${llamaServer}/props`, { signal: AbortSignal.timeout(2000) }),
-      fetch(`${llamaServer}/slots`, { signal: AbortSignal.timeout(2000) })
-    ]);
+    const [healthRes, propsRes, slotsRes] = studioRuntimeUnresolved
+      ? [
+          { status: 'rejected' },
+          { status: 'rejected' },
+          { status: 'rejected' }
+        ]
+      : await Promise.allSettled([
+          fetch(`${llamaServer}/health`, { signal: AbortSignal.timeout(2000) }),
+          fetch(`${llamaServer}/props`, { signal: AbortSignal.timeout(2000) }),
+          fetch(`${llamaServer}/slots`, { signal: AbortSignal.timeout(2000) })
+        ]);
 
     let healthy = false;
     let loading = false;
@@ -1835,10 +1911,13 @@ async function getLlamaInfo() {
 
     // Get model name from /v1/models API (includes full filename with quant format)
     try {
+      if (studioRuntimeUnresolved) throw new Error('Studio runtime identity unresolved');
       const modelsRes = await fetch(`${llamaServer}/v1/models`, { signal: AbortSignal.timeout(2000) });
       if (modelsRes.ok) {
         const modelsData = await modelsRes.json();
-        const firstModel = modelsData?.data?.[0] || null;
+        const firstModel = selectLiveModelFromProbe(modelsData, {
+          requireSingleDistinctId: selectedRuntime?.isUnslothStudio === true,
+        });
         const modelId = firstModel?.id || '';
         if (modelId) {
           healthy = true;
@@ -1861,8 +1940,10 @@ async function getLlamaInfo() {
     // Fallback to running process if API isn't ready yet.
     try {
       const proc = selectedRuntime?.process ||
-        runningLlamaProcesses.find(item => Number(item.port || 0) === Number(llamaPort || 0)) ||
-        runningLlamaProcesses[0] ||
+        (!studioRuntimeUnresolved
+          ? runningLlamaProcesses.find(item => Number(item.port || 0) === Number(llamaPort || 0))
+          : null) ||
+        runningLlamaProcesses.find(item => !isUnslothStudioProcess(item)) ||
         null;
       const cmd = proc?.command || '';
       if (proc && cmd) {
@@ -1900,7 +1981,9 @@ async function getLlamaInfo() {
 
     const status = healthy ? 'running' : (loading || processRunning ? 'loading' : 'stopped');
 
-    const resolvedPorts = selectedLlamaPorts(selectedRuntime, llamaPort);
+    const resolvedPorts = studioRuntimeUnresolved
+      ? { port: null, backendPort: null, proxyPort: null }
+      : selectedLlamaPorts(selectedRuntime, llamaPort);
 
     return {
       engine: 'llama.cpp',

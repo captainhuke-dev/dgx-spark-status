@@ -118,6 +118,42 @@ class BackendResolverTests(unittest.TestCase):
         self.assertEqual(1000.0, resolved.resolved_at)
         self.assertEqual([(36321, 2.0)], self.inspector.probe_calls)
 
+    def test_uses_monotonic_clock_by_default_for_cache_timestamps(self):
+        self.inspector.set_processes([
+            studio_owner(),
+            studio_backend(),
+        ])
+        self.inspector.set_listeners([listener()])
+        self.inspector.set_probe_response(
+            36321,
+            (200, {'data': [{'id': LIVE_MODEL_ID}]}),
+        )
+
+        with mock.patch('unsloth_backend_resolver.time.monotonic', return_value=4321.5):
+            resolver = BackendResolver(inspector=self.inspector)
+            resolved = resolver.resolve()
+
+        self.assertEqual(4321.5, resolved.resolved_at)
+
+    def test_rejects_cache_ttl_outside_open_zero_to_two_second_bound(self):
+        for ttl in (0, -0.1, 2.0001):
+            with self.subTest(ttl=ttl):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    'cache_ttl_seconds must be greater than 0 and at most 2',
+                ):
+                    BackendResolver(
+                        inspector=self.inspector,
+                        cache_ttl_seconds=ttl,
+                    )
+
+        resolver = BackendResolver(
+            inspector=self.inspector,
+            cache_ttl_seconds=2.0,
+            time_fn=self.clock.time,
+        )
+        self.assertEqual(2.0, resolver._cache_ttl_seconds)
+
     def test_selects_realpath_of_configured_studio_launcher(self):
         resolved_executable = f'{STUDIO_ROOT}/llama.cpp/build/bin/llama-server'
         self.inspector.set_processes([
