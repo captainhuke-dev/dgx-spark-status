@@ -141,49 +141,66 @@ assert_listener_available_or_owned() {
   local host="$1"
   local port="$2"
   local unit_name="$3"
-  local main_pid
-  main_pid="$(systemctl_user show --property MainPID --value "${unit_name}" 2>/dev/null || true)"
+  assert_single_exact_owned_listener "${host}" "${port}" "${unit_name}" "1"
+}
+
+assert_single_exact_owned_listener() {
+  local host="$1"
+  local port="$2"
+  local unit_name="$3"
+  local allow_absent="$4"
+  local main_pid_before
+  main_pid_before="$(systemctl_user show --property MainPID --value "${unit_name}" 2>/dev/null || true)"
   local active_records
   active_records="$(listener_records "${host}" "${port}")"
   if [[ -z "${active_records}" ]]; then
-    return 0
-  fi
-  local record
-  while IFS= read -r record; do
-    [[ -z "${record}" ]] && continue
-    if [[ "${record}" == WILDCARD:* ]]; then
-      echo "refusing wildcard listener on required port ${port} for ${unit_name}" >&2
-      exit 1
+    if [[ "${allow_absent}" == "1" ]]; then
+      return 0
     fi
-    local pid="${record#EXACT:}"
-    if [[ -z "${main_pid}" || "${main_pid}" == "0" || "${pid}" != "${main_pid}" ]]; then
-      echo "refusing occupied unowned listener ${host}:${port} for ${unit_name}" >&2
-      exit 1
-    fi
-  done <<< "${active_records}"
-}
-
-assert_listener_present() {
-  local host="$1"
-  local port="$2"
-  local active_records
-  active_records="$(listener_records "${host}" "${port}")"
-  local exact_present="0"
-  local record
-  while IFS= read -r record; do
-    [[ -z "${record}" ]] && continue
-    if [[ "${record}" == WILDCARD:* ]]; then
-      echo "refusing wildcard listener on required port ${port}; exact listener ${host}:${port} is required" >&2
-      exit 1
-    fi
-    if [[ "${record}" == EXACT:* ]]; then
-      exact_present="1"
-    fi
-  done <<< "${active_records}"
-  if [[ "${exact_present}" != "1" ]]; then
     echo "expected listener ${host}:${port} was not present" >&2
     exit 1
   fi
+
+  local main_pid_after
+  main_pid_after="$(systemctl_user show --property MainPID --value "${unit_name}" 2>/dev/null || true)"
+  local record
+  local record_count="0"
+  local exact_record=""
+  while IFS= read -r record; do
+    [[ -z "${record}" ]] && continue
+    record_count="$((record_count + 1))"
+    if [[ "${record}" == WILDCARD:* ]]; then
+      echo "refusing wildcard listener on required port ${port} for ${unit_name}; exact listener ${host}:${port} is required" >&2
+      exit 1
+    fi
+    exact_record="${record}"
+  done <<< "${active_records}"
+
+  if [[ "${record_count}" != "1" || "${exact_record}" != EXACT:* ]]; then
+    echo "expected exactly one listener at ${host}:${port} for ${unit_name}" >&2
+    exit 1
+  fi
+  if [[ "${exact_record}" == "EXACT:PID_METADATA_UNAVAILABLE" ]]; then
+    echo "refusing occupied unowned listener ${host}:${port}; listener ownership metadata is unavailable" >&2
+    exit 1
+  fi
+  if [[ -z "${main_pid_before}" || "${main_pid_before}" == "0" || -z "${main_pid_after}" || "${main_pid_after}" == "0" ]]; then
+    echo "refusing occupied unowned listener ${host}:${port} for ${unit_name}" >&2
+    exit 1
+  fi
+  if [[ "${main_pid_before}" != "${main_pid_after}" ]]; then
+    echo "MainPID changed during listener verification for ${unit_name}" >&2
+    exit 1
+  fi
+  local listener_pid="${exact_record#EXACT:}"
+  if [[ "${listener_pid}" != "${main_pid_after}" ]]; then
+    echo "listener PID ${listener_pid} does not match current MainPID ${main_pid_after} for ${unit_name}" >&2
+    exit 1
+  fi
+}
+
+assert_listener_present() {
+  assert_single_exact_owned_listener "$1" "$2" "$3" "0"
 }
 
 preflight_exposure() {
@@ -220,13 +237,13 @@ main() {
   if [[ "${GUARD_WAS_ACTIVE}" == "0" ]]; then
     GUARD_STARTED="1"
   fi
-  assert_listener_present "127.0.0.1" "${GUARD_PORT}"
+  assert_listener_present "127.0.0.1" "${GUARD_PORT}" "${GUARD_UNIT_NAME}"
 
   systemctl_user start "${LAN_PROXY_UNIT_NAME}"
   if [[ "${LAN_WAS_ACTIVE}" == "0" ]]; then
     LAN_STARTED="1"
   fi
-  assert_listener_present "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}"
+  assert_listener_present "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}" "${LAN_PROXY_UNIT_NAME}"
 
   python3 "${route_helper}" ensure \
     --state-file "${STATE_FILE}" \

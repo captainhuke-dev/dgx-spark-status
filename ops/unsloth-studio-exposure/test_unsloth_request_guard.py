@@ -7,6 +7,7 @@ import pathlib
 import socket
 import sys
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -709,6 +710,54 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
         finally:
             if idle_client is not None:
                 idle_client.close()
+            if next_client is not None:
+                next_client.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(1)
+
+    def test_trickled_header_bytes_cannot_extend_the_absolute_parse_deadline(self):
+        guard = load_guard_module()
+        connection = FakeUpstreamConnection(
+            response=FakeUpstreamResponse(body=b'{"data":[]}')
+        )
+        server = guard._create_server(
+            guard.GuardConfig(
+                request_body_timeout_seconds=0.1,
+                max_concurrent_requests=1,
+            ),
+            resolver=FakeResolver(),
+            server_address=('127.0.0.1', 0),
+            bind_and_activate=True,
+            connection_factory=RecordingConnectionFactory(connection),
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        trickle_client = None
+        next_client = None
+        try:
+            address = server.socket.getsockname()
+            trickle_client = socket.create_connection(address, timeout=1)
+            trickle_client.sendall(b'GET /v1/models HTTP/1.1\r\nX-Slow: ')
+            trickle_started = time.monotonic()
+            while time.monotonic() - trickle_started < 0.3:
+                try:
+                    trickle_client.sendall(b'a')
+                except OSError:
+                    break
+                time.sleep(0.025)
+
+            next_client = socket.create_connection(address, timeout=1)
+            next_client.sendall(
+                b'GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+            )
+            response = self.read_socket_response(next_client)
+
+            self.assertIn(b'HTTP/1.1 200', response)
+            self.assertIn(b'{"data":[]}', response)
+        finally:
+            if trickle_client is not None:
+                trickle_client.close()
             if next_client is not None:
                 next_client.close()
             server.shutdown()

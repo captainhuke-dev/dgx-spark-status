@@ -282,8 +282,30 @@ def _record_route_state(
     )
 
 
-def _compensate_created_route(runner) -> None:
-    runner.run(['tailscale', 'serve', '--bg', f'--tcp={ROUTE_PORT}', 'off'])
+def _compensate_created_route(evidence_dir: Path, runner) -> None:
+    current_document = _capture_evidence(evidence_dir)
+    current = classify_tcp_route(current_document)
+    if current.status == 'conflicting':
+        raise RouteConflict(
+            f'Refusing compensation because TCP {ROUTE_PORT} was replaced by '
+            f'{current.existing_target}.'
+        )
+    if current.status == 'matching':
+        runner.run(['tailscale', 'serve', '--bg', f'--tcp={ROUTE_PORT}', 'off'])
+        verified_document = _capture_evidence(evidence_dir)
+        verified = classify_tcp_route(verified_document)
+        if verified.status != 'absent':
+            raise RouteConflict(
+                f'Compensated TCP {ROUTE_PORT} route was not verified absent.'
+            )
+
+
+def _require_reconciled_route_state(state: dict[str, str]) -> None:
+    if state.get('ROUTE_PENDING', '0') == '1':
+        raise RouteConflict(
+            'ROUTE_PENDING=1 records an interrupted route operation; '
+            'operator reconciliation is required.'
+        )
 
 
 def _capture_command_output(evidence_dir: Path, name: str, argv: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -351,6 +373,8 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     state_file = Path(args.state_file)
     evidence_dir = Path(args.evidence_dir)
+    state = _read_state(state_file)
+    _require_reconciled_route_state(state)
     serve_document = _capture_evidence(evidence_dir)
     runner = SubprocessRunner()
 
@@ -368,7 +392,6 @@ def main(argv: list[str] | None = None) -> int:
             raise RouteConflict(
                 f'Existing TCP {ROUTE_PORT} route points to {classification.existing_target}, not {EXPECTED_TARGET}.'
             )
-        state = _read_state(state_file)
         route_was_owned = _state_claims_route_ownership(state)
         if classification.status == 'matching':
             _record_route_state(
@@ -401,7 +424,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         except BaseException as exc:
             try:
-                _compensate_created_route(runner)
+                _compensate_created_route(evidence_dir, runner)
                 _record_route_state(
                     state_file,
                     created=False,
@@ -418,7 +441,6 @@ def main(argv: list[str] | None = None) -> int:
             raise
         return 0
 
-    state = _read_state(state_file)
     route_created = _state_claims_route_ownership(state)
     classification = remove_owned_tcp_route(
         serve_document,
@@ -427,11 +449,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     route_removed = state.get('ROUTE_REMOVED', '0') == '1'
     if route_created:
-        verified_document = (
-            _capture_evidence(evidence_dir)
-            if classification.status == 'matching'
-            else serve_document
-        )
+        verified_document = _capture_evidence(evidence_dir)
         verified = classify_tcp_route(verified_document)
         if verified.status != 'absent':
             raise RouteConflict(

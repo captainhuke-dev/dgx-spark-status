@@ -42,6 +42,7 @@ test('merges a raw llama backend into its configured guard preset by alias and k
   assert.equal(merged.llama.length, 1);
   assert.equal(merged.llama[0].port, 18132);
   assert.equal(merged.llama[0].backendPort, 18131);
+  assert.equal(merged.llama[0].proxyPort, undefined);
   assert.equal(merged.llama[0].apiModel, 'deepseek0731-flash');
   assert.equal(merged.llama[0].ctx, 278528);
 });
@@ -79,6 +80,7 @@ test('prefers a live probed apiModel over stale configured metadata while keepin
   assert.equal(merged.llama[0].port, UNSLOTH_STUDIO_CLIENT_PORT);
   assert.equal(merged.llama[0].clientPort, UNSLOTH_STUDIO_CLIENT_PORT);
   assert.equal(merged.llama[0].backendPort, 36321);
+  assert.equal(merged.llama[0].proxyPort, UNSLOTH_STUDIO_CLIENT_PORT);
   assert.equal(merged.llama[0].apiModel, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(merged.llama[0].displayName, 'DeepSeek V4 Flash 0731 Unsloth UD-IQ3_XXS');
   assert.equal(merged.llama[0].functionLabel, 'Configured card label');
@@ -164,6 +166,62 @@ test('clears Studio API, running, backend, and client fields when runtime identi
   assert.equal(merged.llama[0].port, null);
   assert.equal(merged.llama[0].clientPort, null);
   assert.equal(merged.llama[0].backendPort, null);
+});
+
+test('multiple configured Studio card matches cannot select the first card', () => {
+  const merged = mergeRunningLlamaProcess({
+    llama: [
+      {
+        name: 'Studio card alpha',
+        apiModel: 'configured-alpha',
+        servedModelName: 'configured-alpha',
+        modelPath: '/models/shared-studio',
+        port: UNSLOTH_STUDIO_CLIENT_PORT,
+        clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+        backendPort: 36320,
+        proxyPort: UNSLOTH_STUDIO_CLIENT_PORT,
+        status: 'stopped',
+        running: false,
+      },
+      {
+        name: 'Studio card beta',
+        apiModel: 'configured-beta',
+        servedModelName: 'configured-beta',
+        modelPath: '/models/shared-studio',
+        port: UNSLOTH_STUDIO_CLIENT_PORT,
+        clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+        backendPort: 36322,
+        proxyPort: UNSLOTH_STUDIO_CLIENT_PORT,
+        status: 'stopped',
+        running: false,
+      },
+    ],
+    vllm: [],
+  }, {
+    port: 36321,
+    alias: 'unsloth/Studio-Live',
+    modelPath: '/models/shared-studio/model.gguf',
+    context: 278528,
+    label: 'Studio Live',
+    executable: installedStudioExecutable(),
+    studioLauncherAncestryVerified: true,
+  }, {
+    status: 'running',
+    apiModel: 'unsloth/Studio-Live',
+    studioRuntimeResolved: true,
+  });
+
+  assert.equal(merged.llama.length, 2);
+  for (const card of merged.llama) {
+    assert.equal(card.apiModel, null);
+    assert.equal(card.servedModelName, null);
+    assert.equal(card.status, 'loading');
+    assert.equal(card.running, false);
+    assert.equal(card.port, null);
+    assert.equal(card.clientPort, null);
+    assert.equal(card.backendPort, null);
+    assert.equal(card.proxyPort, null);
+  }
 });
 
 test('does not expose ports for an unmatched Studio process with unavailable live identity', () => {

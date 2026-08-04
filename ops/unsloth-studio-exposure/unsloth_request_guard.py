@@ -81,6 +81,65 @@ class DownstreamWriteError(Exception):
     pass
 
 
+class RequestHeaderDeadline:
+    def __init__(
+        self,
+        request: socket.socket,
+        deadline: float,
+        release_slot: Callable[[], None],
+    ):
+        self.request = request
+        self.deadline = deadline
+        self._release_slot = release_slot
+        self._lock = threading.Lock()
+        self._active = True
+        self._expired = False
+        self._slot_released = False
+        self._timer = threading.Timer(
+            max(0.0, deadline - time.monotonic()),
+            self._expire,
+        )
+        self._timer.daemon = True
+
+    def start(self) -> None:
+        self._timer.start()
+
+    def cancel(self) -> None:
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+        self._timer.cancel()
+
+    def _expire(self) -> None:
+        release_slot = False
+        with self._lock:
+            if not self._active:
+                return
+            self._active = False
+            self._expired = True
+            if not self._slot_released:
+                self._slot_released = True
+                release_slot = True
+        if release_slot:
+            self._release_slot()
+        try:
+            self.request.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def expired(self) -> bool:
+        with self._lock:
+            return self._expired
+
+    def release_slot(self) -> None:
+        with self._lock:
+            if self._slot_released:
+                return
+            self._slot_released = True
+        self._release_slot()
+
+
 class GuardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -88,8 +147,11 @@ class GuardHTTPServer(ThreadingHTTPServer):
     guard_config: GuardConfig
     upstream_connection_factory: Callable[[str, int, float], object]
     request_slots: threading.BoundedSemaphore
+    request_header_deadlines: dict[int, RequestHeaderDeadline]
+    request_header_deadlines_lock: threading.Lock
 
     def process_request(self, request, client_address) -> None:
+        accepted_at = time.monotonic()
         try:
             request.settimeout(self.guard_config.request_body_timeout_seconds)
         except OSError:
@@ -114,17 +176,43 @@ class GuardHTTPServer(ThreadingHTTPServer):
                 pass
             self.shutdown_request(request)
             return
+        header_deadline = RequestHeaderDeadline(
+            request,
+            accepted_at + self.guard_config.request_body_timeout_seconds,
+            self.request_slots.release,
+        )
+        with self.request_header_deadlines_lock:
+            self.request_header_deadlines[id(request)] = header_deadline
+        header_deadline.start()
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self.request_slots.release()
+            self.finish_tracked_request(request)
             raise
 
     def process_request_thread(self, request, client_address) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.request_slots.release()
+            self.finish_tracked_request(request)
+
+    def complete_request_headers(self, request) -> None:
+        with self.request_header_deadlines_lock:
+            header_deadline = self.request_header_deadlines.get(id(request))
+        if header_deadline is not None:
+            header_deadline.cancel()
+
+    def finish_tracked_request(self, request) -> None:
+        with self.request_header_deadlines_lock:
+            header_deadline = self.request_header_deadlines.pop(id(request), None)
+        if header_deadline is not None:
+            header_deadline.cancel()
+            header_deadline.release_slot()
+
+    def request_headers_expired(self, request) -> bool:
+        with self.request_header_deadlines_lock:
+            header_deadline = self.request_header_deadlines.get(id(request))
+        return header_deadline is not None and header_deadline.expired()
 
 
 def resolve_upstream(server: GuardHTTPServer):
@@ -292,6 +380,17 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
     server_version = 'DGXRequestGuard/1.0'
 
+    def parse_request(self) -> bool:
+        try:
+            return super().parse_request()
+        except OSError:
+            if self.server.request_headers_expired(self.request):
+                self.close_connection = True
+                return False
+            raise
+        finally:
+            self.server.complete_request_headers(self.request)
+
     def do_GET(self) -> None:
         self._handle_proxy_request()
 
@@ -438,6 +537,8 @@ def _create_server(
     server.request_slots = threading.BoundedSemaphore(
         guard_config.max_concurrent_requests
     )
+    server.request_header_deadlines = {}
+    server.request_header_deadlines_lock = threading.Lock()
     return server
 
 

@@ -97,6 +97,24 @@ function processInventoryItem(process, { status, sizeGB, apiModel, studioRuntime
   };
 }
 
+function unresolvedStudioCard(configured) {
+  return {
+    ...configured,
+    apiModel: null,
+    servedModelName: null,
+    status: 'loading',
+    running: false,
+    port: null,
+    clientPort: null,
+    backendPort: null,
+    proxyPort: null,
+    proxyUrl: null,
+    localUrl: null,
+    server: null,
+    connectionLabel: null,
+  };
+}
+
 export function mergeRunningLlamaProcess(models, process, details = {}) {
   const next = {
     ...models,
@@ -104,10 +122,24 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     vllm: (models.vllm || []).filter(model => Number(model.port || 0) !== Number(process.port || 0))
   };
 
-  const index = next.llama.findIndex(model =>
-    Number(model.port || 0) === Number(process.port || 0) ||
-    modelMatchesRunningLlamaProcess(model, process)
-  );
+  const matchingIndexes = next.llama
+    .map((model, index) => (
+      Number(model.port || 0) === Number(process.port || 0) ||
+      modelMatchesRunningLlamaProcess(model, process)
+        ? index
+        : -1
+    ))
+    .filter(index => index >= 0);
+  const studioProcess = isUnslothStudioProcess(process);
+
+  if (studioProcess && matchingIndexes.length > 1) {
+    for (const matchingIndex of matchingIndexes) {
+      next.llama[matchingIndex] = unresolvedStudioCard(next.llama[matchingIndex]);
+    }
+    return next;
+  }
+
+  const index = matchingIndexes[0] ?? -1;
 
   if (index < 0) {
     next.llama.push(processInventoryItem(process, details));
@@ -116,7 +148,6 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
 
   const configured = next.llama[index];
   const status = details.status || 'running';
-  const studioProcess = isUnslothStudioProcess(process);
   const studioRuntimeResolved = !studioProcess || details.studioRuntimeResolved !== false;
   const processClientPort = clientPortForLlamaProcess(process);
   const processBackendPort = backendPortForLlamaProcess(process);
@@ -146,7 +177,15 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     functionLabel: configured.functionLabel || 'Plain GGUF · OpenAI-compatible API',
     connectionLabel: studioProcess
       ? connectionLabelForProcess(process, displayPort)
-      : configured.connectionLabel || connectionLabelForProcess(process, displayPort)
+      : configured.connectionLabel || connectionLabelForProcess(process, displayPort),
+    ...(studioRuntimeResolved
+      ? (studioProcess ? { proxyPort: clientPort } : {})
+      : {
+          proxyPort: null,
+          proxyUrl: null,
+          localUrl: null,
+          server: null,
+        }),
   };
   return next;
 }

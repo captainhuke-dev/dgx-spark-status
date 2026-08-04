@@ -1661,6 +1661,7 @@ async function getAvailableModels() {
       const configuredModel = studioProcess
         ? (configuredMatches.length === 1 ? configuredMatches[0] : null)
         : configuredMatches[0];
+      const configurationAmbiguous = studioProcess && configuredMatches.length > 1;
       const probe = await probeOpenAIModels(proc.port, configuredModel?.host || '127.0.0.1');
       const liveModel = liveModelForLlamaProcess({ data: probe.models }, proc);
       const status = probe.status === 'running' && liveModel?.id ? 'running' : 'loading';
@@ -1681,7 +1682,8 @@ async function getAvailableModels() {
           source: 'process',
           process: proc,
           isUnslothStudio: studioProcess,
-          healthy: status === 'running',
+          healthy: status === 'running' && !configurationAmbiguous,
+          configurationAmbiguous,
           liveApiModelId: String(liveModel?.id || '').trim(),
           liveApiModelIds: (probe.models || [])
             .map(model => String(model?.id || '').trim())
@@ -1704,7 +1706,10 @@ async function getAvailableModels() {
 
     for (const result of orderedProbeResults) {
       const studioProcess = result.candidate.isUnslothStudio;
-      const studioRuntimeResolved = !studioProcess || result.candidate === selectedStudio;
+      const studioRuntimeResolved = !studioProcess || (
+        result.candidate === selectedStudio &&
+        !result.candidate.configurationAmbiguous
+      );
       const merged = mergeRunningLlamaProcess(models, result.process, {
         status: studioRuntimeResolved ? result.status : 'loading',
         sizeGB: result.sizeGB,
@@ -1780,6 +1785,7 @@ async function getLlamaInfo() {
       );
       const matchingConfig = matchingConfigs.length === 1 ? matchingConfigs[0] : null;
       const studioProcess = isUnslothStudioProcess(proc);
+      const configurationAmbiguous = studioProcess && matchingConfigs.length > 1;
       if (studioProcess && matchingConfig) matchingConfig.isUnslothStudio = true;
       const probeHost = matchingConfig ? matchingConfig.probeHost : '127.0.0.1';
       const server = `http://${probeHost}:${proc.port}`;
@@ -1803,6 +1809,7 @@ async function getLlamaInfo() {
         server,
         healthy: false,
         isUnslothStudio: studioProcess,
+        configurationAmbiguous,
         liveApiModelId: '',
         liveApiModelIds: [],
         modelPath: proc.modelPath || matchingConfig?.modelPath || null
@@ -1818,7 +1825,7 @@ async function getLlamaInfo() {
           .filter(Boolean);
         const firstModel = liveModelForLlamaProcess(data, proc);
         if (firstModel?.id && modelApiLooksLikeLlama(data)) {
-          candidate.healthy = true;
+          candidate.healthy = !configurationAmbiguous;
           candidate.liveApiModelId = firstModel.id;
           candidate.modelPath = firstModel.root || candidate.modelPath;
           if (matchingConfig) matchingConfig.backendPort = proc.port;

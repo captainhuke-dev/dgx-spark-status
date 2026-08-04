@@ -32,11 +32,10 @@ parse_args() {
   done
 }
 
-listener_pids() {
+listener_bindings() {
   local host="$1"
   local port="$2"
   python3 - "$host" "$port" <<'PY'
-import re
 import subprocess
 import sys
 
@@ -50,7 +49,14 @@ for line in result.stdout.splitlines():
         continue
     local = parts[3].strip()
     if local in {f'{host}:{port}', f'[{host}]:{port}'}:
-        matches.extend(re.findall(r'pid=(\d+)', line))
+        matches.append('EXACT')
+    elif local in {
+        f'0.0.0.0:{port}',
+        f'[::]:{port}',
+        f':::{port}',
+        f'*:{port}',
+    }:
+        matches.append('WILDCARD')
 print('\n'.join(matches))
 PY
 }
@@ -58,7 +64,13 @@ PY
 assert_listener_closed() {
   local host="$1"
   local port="$2"
-  if [[ -n "$(listener_pids "${host}" "${port}")" ]]; then
+  local active_bindings
+  active_bindings="$(listener_bindings "${host}" "${port}")"
+  if grep -Fxq "WILDCARD" <<< "${active_bindings}"; then
+    echo "required port ${port} is still open through a wildcard listener" >&2
+    exit 1
+  fi
+  if [[ -n "${active_bindings}" ]]; then
     echo "listener ${host}:${port} is still open" >&2
     exit 1
   fi
