@@ -12,11 +12,25 @@ LAN_BIND_ADDRESS="192.168.0.21"
 GUARD_TARGET="127.0.0.1:56828"
 GUARD_PORT="56828"
 PUBLIC_PORT="56827"
+GUARD_STARTED="0"
+LAN_STARTED="0"
 
 systemctl_user() {
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
   /usr/bin/systemctl --user "$@"
+}
+
+cleanup_on_error() {
+  local exit_code="$?"
+  if [[ "${exit_code}" -ne 0 ]]; then
+    if [[ "${LAN_STARTED}" == "1" ]]; then
+      systemctl_user stop "${LAN_PROXY_UNIT_NAME}" || true
+    fi
+    if [[ "${GUARD_STARTED}" == "1" ]]; then
+      systemctl_user stop "${GUARD_UNIT_NAME}" || true
+    fi
+  fi
 }
 
 parse_args() {
@@ -79,10 +93,30 @@ for line in result.stdout.splitlines():
     if len(parts) < 4:
         continue
     local = parts[3].strip()
-    if local in {f'{host}:{port}', f'[{host}]:{port}'}:
+    wildcard_locals = {
+        f'0.0.0.0:{port}',
+        f'[::]:{port}',
+        f':::${port}'.replace('$', ''),
+        f'*:{port}',
+    }
+    if local in {f'{host}:{port}', f'[{host}]:{port}'} | wildcard_locals:
         matches.extend(re.findall(r'pid=(\d+)', line))
 print('\n'.join(matches))
 PY
+}
+
+resolve_route_helper() {
+  local route_helper="${RUNTIME_ROOT}/tailscale_route_state.py"
+  if [[ -x "${route_helper}" ]]; then
+    printf '%s\n' "${route_helper}"
+    return 0
+  fi
+  route_helper="${SCRIPT_DIR}/tailscale_route_state.py"
+  if [[ -x "${route_helper}" ]]; then
+    printf '%s\n' "${route_helper}"
+    return 0
+  fi
+  return 1
 }
 
 assert_listener_available_or_owned() {
@@ -122,19 +156,29 @@ assert_listener_present() {
 main() {
   parse_args "$@"
   mkdir -p "$(dirname "${STATE_FILE}")" "${EVIDENCE_DIR}"
+  trap cleanup_on_error EXIT
+  local route_helper
+  route_helper="$(resolve_route_helper)"
+
+  python3 "${route_helper}" preflight \
+    --state-file "${STATE_FILE}" \
+    --evidence-dir "${EVIDENCE_DIR}"
 
   assert_listener_available_or_owned "127.0.0.1" "${GUARD_PORT}" "${GUARD_UNIT_NAME}"
   systemctl_user start "${GUARD_UNIT_NAME}"
+  GUARD_STARTED="1"
   assert_listener_present "127.0.0.1" "${GUARD_PORT}"
 
   require_lan_address
   assert_listener_available_or_owned "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}" "${LAN_PROXY_UNIT_NAME}"
   systemctl_user start "${LAN_PROXY_UNIT_NAME}"
+  LAN_STARTED="1"
   assert_listener_present "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}"
 
-  python3 "${RUNTIME_ROOT}/tailscale_route_state.py" ensure \
+  python3 "${route_helper}" ensure \
     --state-file "${STATE_FILE}" \
     --evidence-dir "${EVIDENCE_DIR}"
+  trap - EXIT
 }
 
 main "$@"

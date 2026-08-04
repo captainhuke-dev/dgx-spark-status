@@ -1,6 +1,7 @@
 import copy
 import importlib
 import pathlib
+import subprocess
 import sys
 import unittest
 
@@ -106,6 +107,7 @@ class PackagingSurfaceTests(unittest.TestCase):
 
     def test_static_packaging_forbids_wildcard_bind_reset_and_broad_kill_patterns(self):
         disallowed_raw_backend_target = f'--tcp={PUBLIC_PORT} 127.0.0.1:{PUBLIC_PORT}'
+        disallowed_wildcard_bind = 'bind=0.0.0.0'
         for path in (
             INSTALL_SCRIPT,
             REMOVE_SCRIPT,
@@ -118,11 +120,34 @@ class PackagingSurfaceTests(unittest.TestCase):
         ):
             with self.subTest(path=path.name):
                 text = path.read_text()
-                self.assertNotIn(WILDCARD_HOST, text)
+                self.assertNotIn(disallowed_wildcard_bind, text)
                 self.assertNotIn(TAILSCALE_RESET, text)
                 self.assertNotIn(disallowed_raw_backend_target, text)
                 for token in BROAD_KILL_PATTERNS:
                     self.assertNotIn(token, text)
+
+    def test_start_script_preflights_route_before_starting_units(self):
+        text = START_SCRIPT.read_text()
+        route_preflight = text.index('python3 "${route_helper}" preflight')
+        guard_start = text.index('systemctl_user start "${GUARD_UNIT_NAME}"')
+        lan_start = text.index('systemctl_user start "${LAN_PROXY_UNIT_NAME}"')
+
+        self.assertLess(route_preflight, guard_start)
+        self.assertLess(route_preflight, lan_start)
+
+    def test_start_script_listener_preflight_mentions_wildcard_bind_conflicts(self):
+        text = START_SCRIPT.read_text()
+
+        self.assertIn('0.0.0.0', text)
+        self.assertIn('[::]', text)
+        self.assertIn('*', text)
+
+    def test_remove_script_falls_back_to_source_tree_route_helper_for_repeat_safe_remove(self):
+        text = REMOVE_SCRIPT.read_text()
+
+        self.assertIn('route_helper="${RUNTIME_ROOT}/tailscale_route_state.py"', text)
+        self.assertIn('route_helper="${SCRIPT_DIR}/tailscale_route_state.py"', text)
+        self.assertIn('if [[ -n "${route_helper}" && -x "${route_helper}" ]]', text)
 
 
 class TailscaleRouteStateTests(unittest.TestCase):
@@ -242,6 +267,34 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 route_created=True,
             )
         self.assertEqual([], runner.calls)
+
+    def test_capture_evidence_always_records_serve_status_json(self):
+        route_state = load_route_state_module()
+        calls = []
+        original_capture = route_state._capture_command_output
+
+        def fake_capture(evidence_dir, name, argv, *, check=False):
+            calls.append((name, list(argv), check))
+            if name == 'tailscale-serve-get-config-all.json':
+                return subprocess.CompletedProcess(argv, 0, stdout='{"TCP": {"56827": {"TCPForward": "127.0.0.1:56828"}}}', stderr='')
+            if name == 'tailscale-serve-status.json':
+                return subprocess.CompletedProcess(argv, 0, stdout='{"TCP": {"56827": {"TCPForward": "127.0.0.1:56828"}}}', stderr='')
+            return subprocess.CompletedProcess(argv, 0, stdout='{}', stderr='')
+
+        route_state._capture_command_output = fake_capture
+        try:
+            document = route_state._capture_evidence(pathlib.Path('/tmp/dgx-unsloth-exposure-tests'))
+        finally:
+            route_state._capture_command_output = original_capture
+
+        self.assertEqual(
+            {'TCP': {'56827': {'TCPForward': '127.0.0.1:56828'}}},
+            document,
+        )
+        self.assertIn(
+            ('tailscale-serve-status.json', ['tailscale', 'serve', 'status', '--json'], True),
+            calls,
+        )
 
 
 if __name__ == '__main__':

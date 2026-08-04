@@ -20,14 +20,20 @@ systemctl_user() {
 
 main() {
   local stop_helper="${RUNTIME_ROOT}/stop_exposure.sh"
+  local route_helper="${RUNTIME_ROOT}/tailscale_route_state.py"
   if [[ ! -x "${stop_helper}" ]]; then
     stop_helper="${SCRIPT_DIR}/stop_exposure.sh"
   fi
+  if [[ ! -x "${route_helper}" ]]; then
+    route_helper="${SCRIPT_DIR}/tailscale_route_state.py"
+  fi
 
   "${stop_helper}" --state-file "${STATE_FILE}"
-  python3 "${RUNTIME_ROOT}/tailscale_route_state.py" remove \
-    --state-file "${STATE_FILE}" \
-    --evidence-dir "${EVIDENCE_DIR}"
+  if [[ -n "${route_helper}" && -x "${route_helper}" ]]; then
+    python3 "${route_helper}" remove \
+      --state-file "${STATE_FILE}" \
+      --evidence-dir "${EVIDENCE_DIR}"
+  fi
 
   systemctl_user disable "${LAN_PROXY_UNIT_NAME}"
   systemctl_user disable "${GUARD_UNIT_NAME}"

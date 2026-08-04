@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import os
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -242,6 +241,13 @@ def _capture_command_output(evidence_dir: Path, name: str, argv: list[str], *, c
 
 
 def _load_serve_document(evidence_dir: Path) -> Any:
+    status_result = _capture_command_output(
+        evidence_dir,
+        'tailscale-serve-status.json',
+        ['tailscale', 'serve', 'status', '--json'],
+        check=True,
+    )
+    status_document = json.loads(status_result.stdout)
     config_result = _capture_command_output(
         evidence_dir,
         'tailscale-serve-get-config-all.json',
@@ -250,13 +256,7 @@ def _load_serve_document(evidence_dir: Path) -> Any:
     )
     if config_result.returncode == 0 and config_result.stdout.strip():
         return json.loads(config_result.stdout)
-    status_result = _capture_command_output(
-        evidence_dir,
-        'tailscale-serve-status.json',
-        ['tailscale', 'serve', 'status', '--json'],
-        check=True,
-    )
-    return json.loads(status_result.stdout)
+    return status_document
 
 
 def _capture_evidence(evidence_dir: Path) -> Any:
@@ -281,6 +281,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         subparser.add_argument('--state-file', default=DEFAULT_STATE_FILE)
         subparser.add_argument('--evidence-dir', required=True)
 
+    add_common_arguments(subparsers.add_parser('preflight'))
     add_common_arguments(subparsers.add_parser('ensure'))
     add_common_arguments(subparsers.add_parser('remove'))
     return parser.parse_args(argv)
@@ -292,6 +293,14 @@ def main(argv: list[str] | None = None) -> int:
     evidence_dir = Path(args.evidence_dir)
     serve_document = _capture_evidence(evidence_dir)
     runner = SubprocessRunner()
+
+    if args.command == 'preflight':
+        classification = classify_tcp_route(serve_document)
+        if classification.status == 'conflicting':
+            raise RouteConflict(
+                f'Existing TCP {ROUTE_PORT} route points to {classification.existing_target}, not {EXPECTED_TARGET}.'
+            )
+        return 0
 
     if args.command == 'ensure':
         classification = ensure_tcp_route(serve_document, runner=runner)
