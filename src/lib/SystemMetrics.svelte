@@ -24,6 +24,7 @@
   let stopAllAction = $state({});
   let agentProcessActions = $state({ claude: {}, codex: {} });
   let ds4Action = $state({});
+  let copiedModelIds = $state({});
   let modelControlTimer = null;
   let graphTopology = $state(null);
   let graphifyError = $state('');
@@ -31,6 +32,7 @@
   let dgxHealth = $state(null);
   let dgxHealthError = $state('');
   let dgxHealthTimer = null;
+  const modelIdCopyResetTimers = new Map();
 
   const DGX_HEALTH_BASE_PORTS = [9000, 11000];
 
@@ -90,6 +92,8 @@
     if (modelControlTimer) { clearInterval(modelControlTimer); modelControlTimer = null; }
     if (graphifyTimer) { clearInterval(graphifyTimer); graphifyTimer = null; }
     if (dgxHealthTimer) { clearInterval(dgxHealthTimer); dgxHealthTimer = null; }
+    for (const timer of modelIdCopyResetTimers.values()) clearTimeout(timer);
+    modelIdCopyResetTimers.clear();
   });
 
   async function loadModelControls() {
@@ -179,6 +183,26 @@
       Number.isFinite(Number(nvrm)) ? `NVRM delta ${nvrm}` : null,
       status.localhost_only === false ? `bind ${status.listener_host || status.bind_scope || 'non-localhost'}` : null
     ].filter(Boolean).join(' · ');
+  }
+
+  function isModelIdCopied(modelId) {
+    return Boolean(modelId && copiedModelIds[modelId]);
+  }
+
+  async function copyModelId(modelId) {
+    if (!modelId || typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return;
+
+    try {
+      await navigator.clipboard.writeText(modelId);
+      copiedModelIds = { ...copiedModelIds, [modelId]: true };
+      if (modelIdCopyResetTimers.has(modelId)) clearTimeout(modelIdCopyResetTimers.get(modelId));
+      modelIdCopyResetTimers.set(modelId, setTimeout(() => {
+        copiedModelIds = { ...copiedModelIds, [modelId]: false };
+        modelIdCopyResetTimers.delete(modelId);
+      }, 1500));
+    } catch (_error) {
+      copiedModelIds = { ...copiedModelIds, [modelId]: false };
+    }
   }
 
   async function runDs4Action(action) {
@@ -722,16 +746,18 @@
                   {@const control = controlForModel(model, runtimeModel, displayPort)}
                   {@const effectiveStatus = resolveModelDisplayStatus(control?.status, runtimeModel?.status, model.status)}
 	                {@const isRunning = isActiveControlStatus(effectiveStatus)}
+                  {@const liveModelId = modelIdValue(model)}
+                  {@const copied = isModelIdCopied(liveModelId)}
                   {@const controlState = control ? actionState(control.profile_id) : {}}
 	                {@const noteId = `llama:${model.key || model.name}`}
                 <div class="model-item {isRunning ? 'loaded' : ''}">
                   <div class="model-header-row">
                     <div class="model-title-wrap">
                       <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
-                      {#if modelIdValue(model)}
+                      {#if liveModelId}
                         <div class="model-id-row">
-                          <span class="model-id-label">Model ID</span>
-                          <span class="model-id-value" title={modelIdValue(model)}>{modelIdValue(model)}</span>
+                          <span class="model-id-value" title={liveModelId}>{liveModelId}</span>
+                          <button type="button" class="model-id-copy" title="Copy full model ID" aria-label="Copy full model ID" onclick={() => copyModelId(liveModelId)}>{copied ? 'Copied' : 'Copy'}</button>
                         </div>
                       {/if}
                     </div>
@@ -803,16 +829,18 @@
                 {@const control = controlForModel(model, runtimeModel, displayPort)}
                 {@const effectiveStatus = resolveModelDisplayStatus(control?.status, runtimeModel?.status, model.status, (metrics.inference.vllm.status !== 'stopped' && metrics.inference.vllm.model && model.name.includes(metrics.inference.vllm.model)) ? metrics.inference.vllm.status : null)}
                 {@const isRunning = isActiveControlStatus(effectiveStatus)}
+                {@const liveModelId = modelIdValue(model)}
+                {@const copied = isModelIdCopied(liveModelId)}
                 {@const controlState = control ? actionState(control.profile_id) : {}}
                 {@const noteId = `vllm:${model.name}`}
                 <div class="model-item {isRunning ? 'loaded' : ''}">
                   <div class="model-header-row">
                     <div class="model-title-wrap">
                       <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
-                      {#if modelIdValue(model)}
+                      {#if liveModelId}
                         <div class="model-id-row">
-                          <span class="model-id-label">Model ID</span>
-                          <span class="model-id-value" title={modelIdValue(model)}>{modelIdValue(model)}</span>
+                          <span class="model-id-value" title={liveModelId}>{liveModelId}</span>
+                          <button type="button" class="model-id-copy" title="Copy full model ID" aria-label="Copy full model ID" onclick={() => copyModelId(liveModelId)}>{copied ? 'Copied' : 'Copy'}</button>
                         </div>
                       {/if}
                     </div>
@@ -882,15 +910,17 @@
                 {#each sortModelsForDisplay(metrics.inference.ollama.models.map(model => ({ ...model, status: metrics.inference.ollama.runningModel === model.name ? 'running' : (model.status || 'installed') }))) as model}
                   {@const runtimeModel = isDs4Model(model) ? null : metrics.inference.vllm.models?.find(r => (model.port && r.port && Number(model.port) === Number(r.port)) || (model.name && r.name && model.name === r.name) || (model.name && r.modelAlias && model.name === r.modelAlias) || (model.apiModel && r.modelAlias && model.apiModel === r.modelAlias))}
                   {@const isRunning = isDs4Model(model) ? Boolean(model.ds4Status?.running) : (runtimeModel ? (runtimeModel.status === 'running' || runtimeModel.status === 'loading') : (model.status ? (model.status === 'running' || model.status === 'loading') : false))}
+                  {@const liveModelId = modelIdValue(model)}
+                  {@const copied = isModelIdCopied(liveModelId)}
                   {@const noteId = `ollama:${model.name}`}
                   <div class="model-item {isRunning ? 'loaded' : ''}">
                   <div class="model-header-row">
                     <div class="model-title-wrap">
                       <div class="model-name" title={displayModelName(model)}>{displayModelName(model)}</div>
-                      {#if modelIdValue(model)}
+                      {#if liveModelId}
                         <div class="model-id-row">
-                          <span class="model-id-label">Model ID</span>
-                          <span class="model-id-value" title={modelIdValue(model)}>{modelIdValue(model)}</span>
+                          <span class="model-id-value" title={liveModelId}>{liveModelId}</span>
+                          <button type="button" class="model-id-copy" title="Copy full model ID" aria-label="Copy full model ID" onclick={() => copyModelId(liveModelId)}>{copied ? 'Copied' : 'Copy'}</button>
                         </div>
                       {/if}
                     </div>
@@ -1554,19 +1584,11 @@
 
   .model-id-row {
     display: flex;
-    align-items: baseline;
+    align-items: flex-start;
+    flex-wrap: wrap;
     gap: 0.3rem;
     margin-top: 0.16rem;
     min-width: 0;
-  }
-
-  .model-id-label {
-    color: #9aa096;
-    font-size: 0.54rem;
-    font-weight: 700;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    flex-shrink: 0;
   }
 
   .model-id-value {
@@ -1575,9 +1597,25 @@
     font-family: 'Monaco', 'Menlo', monospace;
     line-height: 1.25;
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    flex: 1 1 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .model-id-copy {
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 0.12rem 0.35rem;
+    font-size: 0.58rem;
+    font-weight: 700;
+    cursor: pointer;
+    color: #cfcfcf;
+    background: #171717;
+  }
+
+  .model-id-copy:hover {
+    border-color: #76b900;
+    color: #fff;
   }
 
   .model-function {

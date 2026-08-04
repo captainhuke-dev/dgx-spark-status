@@ -568,3 +568,334 @@ Run npm run preview to preview your production build locally.
 ## Concerns
 
 - `npm run build` succeeds, but Vite/Svelte still reports pre-existing accessibility warnings for the clickable `.note-display` `<div>` blocks at lines 776, 862, and 936 in `src/lib/SystemMetrics.svelte`. This task did not change those note controls.
+
+---
+
+## Fix round 1 — full visible IDs plus copy buttons
+
+Implementation commit SHA: `TBD_AFTER_COMMIT`
+
+Implementation commit message: `Show full model IDs with copy buttons`
+
+### Files changed
+
+- `src/lib/SystemMetrics.svelte`
+- `test/model-card-display.test.js`
+
+### Scope summary
+
+- Replaced the labeled/truncated dedicated ID row with a full visible exact ID value plus a visible copy button for LLAMA, vLLM, and ETC cards.
+- Kept `modelIdValue(model)` as the dynamic source for all three card types.
+- Added browser clipboard copy behavior with a short `Copied` success state and accessible `title`/`aria-label` text on each copy button.
+- Removed the dedicated-row visible `Model ID` text and removed truncation/clipping styling from the dedicated ID value.
+- Preserved existing card titles, status badges, connection rows, controls, and inventory-only behavior.
+
+### Test/build commands and exact outputs
+
+#### Red run
+
+Command:
+
+```bash
+node --test test/model-card-display.test.js
+```
+
+Output:
+
+```text
+TAP version 13
+# Subtest: formats DS4 240K-total context and input/output budgets compactly
+ok 1 - formats DS4 240K-total context and input/output budgets compactly
+  ---
+  duration_ms: 0.373172
+  type: 'test'
+  ...
+# Subtest: modelIdValue returns the exact live API model ID even when the display name matches
+ok 2 - modelIdValue returns the exact live API model ID even when the display name matches
+  ---
+  duration_ms: 0.069761
+  type: 'test'
+  ...
+# Subtest: modelIdValue does not invent an ID from an empty model name
+ok 3 - modelIdValue does not invent an ID from an empty model name
+  ---
+  duration_ms: 0.046289
+  type: 'test'
+  ...
+# Subtest: SystemMetrics renders full model ID rows with copy buttons for llama, vLLM, and ETC cards
+not ok 4 - SystemMetrics renders full model ID rows with copy buttons for llama, vLLM, and ETC cards
+  ---
+  duration_ms: 0.981113
+  type: 'test'
+  location: '/home/mctdgx01/dgx-spark-status/test/model-card-display.test.js:40:1'
+  failureType: 'testCodeFailure'
+  error: |-
+    Expected values to be strictly equal:
+
+    0 !== 3
+
+  code: 'ERR_ASSERTION'
+  name: 'AssertionError'
+  expected: 3
+  actual: 0
+  operator: 'strictEqual'
+  stack: |-
+    TestContext.<anonymous> (file:///home/mctdgx01/dgx-spark-status/test/model-card-display.test.js:45:10)
+    Test.runInAsyncScope (node:async_hooks:214:14)
+    Test.run (node:internal/test_runner/test:1047:25)
+    Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+    Test.postRun (node:internal/test_runner/test:1173:19)
+    Test.run (node:internal/test_runner/test:1101:12)
+    async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+  ...
+1..4
+# tests 4
+# suites 0
+# pass 3
+# fail 1
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 33.588725
+```
+
+#### Focused green run
+
+Command:
+
+```bash
+node --test test/model-card-display.test.js
+```
+
+Output:
+
+```text
+TAP version 13
+# Subtest: formats DS4 240K-total context and input/output budgets compactly
+ok 1 - formats DS4 240K-total context and input/output budgets compactly
+  ---
+  duration_ms: 0.384068
+  type: 'test'
+  ...
+# Subtest: modelIdValue returns the exact live API model ID even when the display name matches
+ok 2 - modelIdValue returns the exact live API model ID even when the display name matches
+  ---
+  duration_ms: 0.070688
+  type: 'test'
+  ...
+# Subtest: modelIdValue does not invent an ID from an empty model name
+ok 3 - modelIdValue does not invent an ID from an empty model name
+  ---
+  duration_ms: 0.045568
+  type: 'test'
+  ...
+# Subtest: SystemMetrics renders full model ID rows with copy buttons for llama, vLLM, and ETC cards
+ok 4 - SystemMetrics renders full model ID rows with copy buttons for llama, vLLM, and ETC cards
+  ---
+  duration_ms: 1.090827
+  type: 'test'
+  ...
+1..4
+# tests 4
+# suites 0
+# pass 4
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 32.73264
+```
+
+#### Full suite
+
+Command:
+
+```bash
+npm test
+```
+
+Output:
+
+```text
+> dgx-spark-status@0.0.0 test
+> node --test test/*.test.js
+
+TAP version 13
+# tests 72
+# suites 0
+# pass 72
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 420.45783
+```
+
+#### Build verification
+
+Command:
+
+```bash
+npm run build
+```
+
+Output:
+
+```text
+> dgx-spark-status@0.0.0 build
+> vite build
+
+vite v7.3.1 building ssr environment for production...
+transforming...
+6:55:57 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:802:20 Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+800:                     </div>
+801:                   {:else}
+802:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+803:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+804:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:57 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:802:20 `<div>` with a click handler must have an ARIA role
+https://svelte.dev/e/a11y_no_static_element_interactions
+800:                     </div>
+801:                   {:else}
+802:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+803:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+804:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:57 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:890:20 Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+888:                     </div>
+889:                   {:else}
+890:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+891:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+892:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:57 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:890:20 `<div>` with a click handler must have an ARIA role
+https://svelte.dev/e/a11y_no_static_element_interactions
+888:                     </div>
+889:                   {:else}
+890:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+891:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+892:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:57 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:966:22 Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+964:                       </div>
+965:                     {:else}
+966:                       <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                                 ^
+967:                         {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+968:                         <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:57 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:966:22 `<div>` with a click handler must have an ARIA role
+https://svelte.dev/e/a11y_no_static_element_interactions
+964:                       </div>
+965:                     {:else}
+966:                       <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                                 ^
+967:                         {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+968:                         <span class="note-edit-icon" title="Edit note">✏️</span>
+✓ 204 modules transformed.
+rendering chunks...
+vite v7.3.1 building client environment for production...
+transforming...
+6:55:58 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:802:20 Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+800:                     </div>
+801:                   {:else}
+802:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+803:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+804:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:58 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:802:20 `<div>` with a click handler must have an ARIA role
+https://svelte.dev/e/a11y_no_static_element_interactions
+800:                     </div>
+801:                   {:else}
+802:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+803:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+804:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:58 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:890:20 Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+888:                     </div>
+889:                   {:else}
+890:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+891:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+892:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:58 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:890:20 `<div>` with a click handler must have an ARIA role
+https://svelte.dev/e/a11y_no_static_element_interactions
+888:                     </div>
+889:                   {:else}
+890:                     <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                               ^
+891:                       {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+892:                       <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:58 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:966:22 Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events
+964:                       </div>
+965:                     {:else}
+966:                       <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                                 ^
+967:                         {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+968:                         <span class="note-edit-icon" title="Edit note">✏️</span>
+6:55:58 PM [vite-plugin-svelte] src/lib/SystemMetrics.svelte:966:22 `<div>` with a click handler must have an ARIA role
+https://svelte.dev/e/a11y_no_static_element_interactions
+964:                       </div>
+965:                     {:else}
+966:                       <div class="note-display" onclick={() => startEditNote(noteId, getNote(noteId))}>
+                                 ^
+967:                         {#if getNote(noteId)}<span class="note-text">{getNote(noteId)}</span>{/if}
+968:                         <span class="note-edit-icon" title="Edit note">✏️</span>
+✓ 162 modules transformed.
+rendering chunks...
+computing gzip size...
+.svelte-kit/output/client/_app/version.json                        0.03 kB │ gzip:  0.05 kB
+.svelte-kit/output/client/.vite/manifest.json                      3.08 kB │ gzip:  0.60 kB
+.svelte-kit/output/client/_app/immutable/assets/0.BoEVJnPZ.css     0.81 kB │ gzip:  0.46 kB
+.svelte-kit/output/client/_app/immutable/assets/2.DF4OMjjd.css    24.20 kB │ gzip:  4.92 kB
+.svelte-kit/output/client/_app/immutable/chunks/CLD2Ge5n.js        0.03 kB │ gzip:  0.05 kB
+.svelte-kit/output/client/_app/immutable/entry/start.CjTvym70.js   0.08 kB │ gzip:  0.09 kB
+.svelte-kit/output/client/_app/immutable/nodes/0.CKo6XDjN.js       0.33 kB │ gzip:  0.25 kB
+.svelte-kit/output/client/_app/immutable/chunks/Bt56_tVe.js        0.37 kB │ gzip:  0.26 kB
+.svelte-kit/output/client/_app/immutable/nodes/1.hAI-axQ8.js       1.02 kB │ gzip:  0.58 kB
+.svelte-kit/output/client/_app/immutable/chunks/DV5Dk4_J.js        1.39 kB │ gzip:  0.74 kB
+.svelte-kit/output/client/_app/immutable/chunks/t2jIknds.js        2.73 kB │ gzip:  1.30 kB
+.svelte-kit/output/client/_app/immutable/entry/app.BcF25zUV.js     5.68 kB │ gzip:  2.65 kB
+.svelte-kit/output/client/_app/immutable/chunks/QqyJ4F7F.js        5.70 kB │ gzip:  2.59 kB
+.svelte-kit/output/client/_app/immutable/chunks/vu83rdnr.js       22.30 kB │ gzip:  8.87 kB
+.svelte-kit/output/client/_app/immutable/chunks/BO2nC581.js       26.07 kB │ gzip: 10.27 kB
+.svelte-kit/output/client/_app/immutable/nodes/2.CFBCgZh9.js      81.78 kB │ gzip: 24.42 kB
+✓ built in 597ms
+.svelte-kit/output/server/.vite/manifest.json                           3.46 kB
+.svelte-kit/output/server/_app/immutable/assets/_layout.BoEVJnPZ.css    0.81 kB
+.svelte-kit/output/server/_app/immutable/assets/_page.DPFpmw8f.css     17.95 kB
+.svelte-kit/output/server/entries/pages/_layout.svelte.js               0.23 kB
+.svelte-kit/output/server/internal.js                                   0.33 kB
+.svelte-kit/output/server/chunks/equality.js                            0.33 kB
+.svelte-kit/output/server/chunks/environment.js                         0.66 kB
+.svelte-kit/output/server/chunks/utils.js                               1.15 kB
+.svelte-kit/output/server/entries/fallbacks/error.svelte.js             1.32 kB
+.svelte-kit/output/server/entries/pages/_page.svelte.js                 1.68 kB
+.svelte-kit/output/server/chunks/context.js                             2.65 kB
+.svelte-kit/output/server/entries/hooks.server.js                       3.54 kB
+.svelte-kit/output/server/entries/endpoints/api/ollama/_server.js       3.58 kB
+.svelte-kit/output/server/chunks/exports.js                             7.04 kB
+.svelte-kit/output/server/entries/endpoints/api/metrics/_server.js     12.53 kB
+.svelte-kit/output/server/remote-entry.js                              18.96 kB
+.svelte-kit/output/server/chunks/shared.js                             25.96 kB
+.svelte-kit/output/server/chunks/index.js                              29.77 kB
+.svelte-kit/output/server/chunks/internal.js                           78.13 kB
+.svelte-kit/output/server/index.js                                    120.28 kB
+✓ built in 1.79s
+
+Run npm run preview to preview your production build locally.
+
+> Using @sveltejs/adapter-node
+  ✔ done
+```
+
+### Concerns
+
+- `npm run build` still succeeds with the same pre-existing `note-display` accessibility warnings; only the line numbers moved after this fix.
+- Because a committed report file cannot self-contain its own final commit SHA in a single commit, this section is recorded in two steps: the implementation commit below, followed by a report-sync commit that writes that exact SHA into the report without amending history.
