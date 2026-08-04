@@ -1,0 +1,14 @@
+[Unit]
+Description=DGX Unsloth dynamic request guard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/mctdgx01/.local/lib/dgx-unsloth-exposure/unsloth_request_guard.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target

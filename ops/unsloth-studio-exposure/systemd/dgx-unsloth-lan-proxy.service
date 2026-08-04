@@ -1,0 +1,14 @@
+[Unit]
+Description=DGX Unsloth LAN client proxy
+After=dgx-unsloth-guard.service network-online.target
+Requires=dgx-unsloth-guard.service
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:56827,bind=192.168.0.21,reuseaddr,fork TCP:127.0.0.1:56828
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
