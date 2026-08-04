@@ -92,15 +92,7 @@ class RealInspector:
         )
         listeners: list[ListenerRecord] = []
         for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 7:
-                continue
-            host_port = _split_host_port(parts[4])
-            if host_port is None:
-                continue
-            host, port = host_port
-            for pid in _parse_ss_pids(parts[6]):
-                listeners.append(ListenerRecord(pid=pid, host=host, port=port))
+            listeners.extend(_parse_ss_listener_line(line))
         return listeners
 
     def probe_models(self, port: int, timeout_seconds: float):
@@ -141,7 +133,11 @@ class BackendResolver:
             if age < self._cache_ttl_seconds:
                 return self._cached_backend
 
-        resolved_candidates = self._discover_candidates(now)
+        try:
+            resolved_candidates = self._discover_candidates(now)
+        except BackendError:
+            self.invalidate()
+            raise
         if not resolved_candidates:
             self.invalidate()
             raise BackendUnavailable('No ready Unsloth Studio backend found.')
@@ -155,7 +151,10 @@ class BackendResolver:
     def _discover_candidates(self, now: float) -> list[ResolvedBackend]:
         processes = self._inspector.processes()
         process_by_pid = {process.pid: process for process in processes}
-        listeners_by_pid = _index_listeners(self._inspector.listeners())
+        try:
+            listeners_by_pid = _index_listeners(self._inspector.listeners())
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return []
         resolved: list[ResolvedBackend] = []
 
         for process in processes:
@@ -181,7 +180,10 @@ class BackendResolver:
             if status_code != 200:
                 continue
 
-            model_id = _extract_single_model_id(payload)
+            try:
+                model_id = _extract_single_model_id(payload)
+            except (AttributeError, TypeError, ValueError):
+                continue
             if model_id is None:
                 continue
 
@@ -246,6 +248,20 @@ def _split_host_port(value: str) -> tuple[str, int] | None:
     return host, int(port_text)
 
 
+def _parse_ss_listener_line(line: str) -> list[ListenerRecord]:
+    parts = line.split(maxsplit=5)
+    if len(parts) < 6:
+        return []
+    host_port = _split_host_port(parts[3])
+    if host_port is None:
+        return []
+    host, port = host_port
+    return [
+        ListenerRecord(pid=pid, host=host, port=port)
+        for pid in _parse_ss_pids(parts[5])
+    ]
+
+
 def _parse_ss_pids(process_field: str) -> Iterable[int]:
     for match in re.finditer(r'pid=(\d+)', process_field):
         yield int(match.group(1))
@@ -287,6 +303,8 @@ def _owns_loopback_listener(
 
 
 def _extract_single_model_id(payload) -> str | None:
+    if not isinstance(payload, dict):
+        return None
     data = payload.get('data')
     if not isinstance(data, list):
         return None

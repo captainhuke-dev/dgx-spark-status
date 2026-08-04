@@ -1,4 +1,6 @@
+import subprocess
 import unittest
+from unittest import mock
 
 from unsloth_backend_resolver import (
     BackendAmbiguous,
@@ -6,6 +8,7 @@ from unsloth_backend_resolver import (
     BackendUnavailable,
     ListenerRecord,
     ProcessRecord,
+    RealInspector,
 )
 
 
@@ -31,6 +34,7 @@ class FakeInspector:
         self._listeners = []
         self._probe_responses = {}
         self.probe_calls = []
+        self.listener_error = None
 
     def set_processes(self, processes):
         self._processes = list(processes)
@@ -45,6 +49,8 @@ class FakeInspector:
         return list(self._processes)
 
     def listeners(self):
+        if self.listener_error is not None:
+            raise self.listener_error
         return list(self._listeners)
 
     def probe_models(self, port, timeout_seconds):
@@ -271,6 +277,86 @@ class BackendResolverTests(unittest.TestCase):
         self.assertEqual(41237, second.port)
         self.assertEqual('unsloth/DeepSeek-V4-Flash-0731-GGUF-Rotated', second.model_id)
         self.assertEqual([(36321, 2.0), (41237, 2.0)], self.inspector.probe_calls)
+
+    def test_real_inspector_parses_standard_ss_listener_row(self):
+        inspector = RealInspector()
+        completed = subprocess.CompletedProcess(
+            args=['ss', '-H', '-ltnp'],
+            returncode=0,
+            stdout='LISTEN 0 4096 127.0.0.1:36321 0.0.0.0:* users:(("llama-server",pid=716619,fd=42))\n',
+            stderr='',
+        )
+
+        with mock.patch('unsloth_backend_resolver.subprocess.run', return_value=completed):
+            listeners = inspector.listeners()
+
+        self.assertEqual(
+            [ListenerRecord(pid=716619, host='127.0.0.1', port=36321)],
+            listeners,
+        )
+
+    def test_returns_backend_unavailable_when_listener_scan_fails_after_cache_expiry(self):
+        self.inspector.set_processes([
+            studio_owner(),
+            studio_backend(),
+        ])
+        self.inspector.set_listeners([listener()])
+        self.inspector.set_probe_response(
+            36321,
+            (200, {'data': [{'id': LIVE_MODEL_ID}]}),
+        )
+
+        first = self.resolver.resolve()
+        self.clock.advance(2.1)
+        self.inspector.listener_error = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=['ss', '-H', '-ltnp'],
+        )
+
+        with self.assertRaises(BackendUnavailable) as raised:
+            self.resolver.resolve()
+
+        self.assertEqual('backend_unavailable', raised.exception.code)
+        self.assertIsNone(self.resolver._cached_backend)
+
+        self.inspector.listener_error = None
+        second = self.resolver.resolve()
+
+        self.assertEqual(first.port, second.port)
+        self.assertEqual([(36321, 2.0), (36321, 2.0)], self.inspector.probe_calls)
+
+    def test_returns_backend_unavailable_for_malformed_http_200_probe_payload(self):
+        self.inspector.set_processes([
+            studio_owner(),
+            studio_backend(),
+        ])
+        self.inspector.set_listeners([listener()])
+        self.inspector.set_probe_response(
+            36321,
+            (200, {'data': [{'id': LIVE_MODEL_ID}]}),
+        )
+
+        self.resolver.resolve()
+        self.clock.advance(2.1)
+        self.inspector.set_probe_response(36321, (200, 'not-a-dict'))
+
+        with self.assertRaises(BackendUnavailable) as raised:
+            self.resolver.resolve()
+
+        self.assertEqual('backend_unavailable', raised.exception.code)
+        self.assertIsNone(self.resolver._cached_backend)
+
+        self.inspector.set_probe_response(
+            36321,
+            (200, {'data': [{'id': LIVE_MODEL_ID}]}),
+        )
+        resolved = self.resolver.resolve()
+
+        self.assertEqual(36321, resolved.port)
+        self.assertEqual(
+            [(36321, 2.0), (36321, 2.0), (36321, 2.0)],
+            self.inspector.probe_calls,
+        )
 
 
 if __name__ == '__main__':
