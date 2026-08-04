@@ -16,6 +16,7 @@ import { classifyInventoryConfig } from './model-inventory-section.js';
 import { parseRunningLlamaProcessLine, selectedLlamaPorts } from './llama-process-inventory.js';
 import {
   clientPortForLlamaProcess,
+  isUnslothStudioProcess,
   mergeRunningLlamaProcess,
   modelMatchesRunningLlamaProcess
 } from './runtime-model-inventory.js';
@@ -895,20 +896,70 @@ function envDisplayName(env) {
   return (env.MODEL_PATH || '').split('/').filter(Boolean).pop();
 }
 
-function configuredLlamaCandidateMatchesProcess(candidate = {}, process = {}) {
+function normalizedIdentityValue(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function candidateProcessIdentity(candidate = {}) {
+  const env = candidate.env || {};
+  const process = candidate.process || {};
+  return {
+    pid: candidate.pid ?? process.pid ?? env.PID ?? env.SERVER_PID ?? env.LLAMA_PID,
+    ppid: candidate.ppid ?? process.ppid ?? env.PPID ?? env.SERVER_PPID ?? env.LLAMA_PPID,
+    startedAt: candidate.startedAt ?? process.startedAt ?? env.STARTED_AT ?? env.START_TIME ?? env.STARTED,
+    command: candidate.command ?? process.command ?? env.COMMAND
+  };
+}
+
+function stableProcessIdentityState(candidate = {}, process = {}) {
+  const configuredIdentity = candidateProcessIdentity(candidate);
+  const identityFields = ['pid', 'ppid', 'startedAt', 'command'];
+  const comparableFields = identityFields.filter(field => {
+    const expected = normalizedIdentityValue(configuredIdentity[field]);
+    const actual = normalizedIdentityValue(process[field]);
+    return expected && actual;
+  });
+  if (!comparableFields.length) return 'unknown';
+  return comparableFields.every(field =>
+    normalizedIdentityValue(configuredIdentity[field]) === normalizedIdentityValue(process[field])
+  ) ? 'match' : 'conflict';
+}
+
+function candidateModelIdentity(candidate = {}) {
+  const env = candidate.env || {};
+  const displayName = envDisplayName(env);
+  return {
+    apiModel: candidate.liveApiModelId || candidate.apiModel || env.API_MODEL_ID || null,
+    servedModelName: candidate.servedModelName || env.SERVED_MODEL_NAME || env.MODEL_ID || null,
+    modelAlias: candidate.alias || candidate.modelAlias || env.API_MODEL_ID || null,
+    name: candidate.name || displayName,
+    key: candidate.key || displayName,
+    modelPath: candidate.modelPath || candidate.path || env.MODEL_PATH || null,
+    path: candidate.modelPath || candidate.path || env.MODEL_PATH || null
+  };
+}
+
+export function configuredLlamaCandidateMatchesProcess(candidate = {}, process = {}, candidates = []) {
+  const stableIdentity = stableProcessIdentityState(candidate, process);
+  if (stableIdentity === 'match' ||
+      modelMatchesRunningLlamaProcess(candidateModelIdentity(candidate), process)) {
+    return true;
+  }
+  if (stableIdentity === 'conflict') return false;
+
   const candidateClientPort = numericPort(candidate.clientPort ?? candidate.port);
   const processClientPort = numericPort(process.clientPort);
-  if (candidateClientPort && processClientPort && candidateClientPort === processClientPort) return true;
+  if (!candidateClientPort || !processClientPort || candidateClientPort !== processClientPort) {
+    return false;
+  }
 
-  return modelMatchesRunningLlamaProcess({
-    apiModel: candidate.liveApiModelId || candidate.env?.API_MODEL_ID || null,
-    servedModelName: candidate.env?.SERVED_MODEL_NAME || candidate.env?.MODEL_ID || null,
-    modelAlias: candidate.env?.API_MODEL_ID || null,
-    name: envDisplayName(candidate.env || {}),
-    key: envDisplayName(candidate.env || {}),
-    modelPath: candidate.modelPath || candidate.env?.MODEL_PATH || null,
-    path: candidate.modelPath || candidate.env?.MODEL_PATH || null
-  }, process);
+  if (!isUnslothStudioProcess(process)) return true;
+
+  const candidatePool = Array.isArray(candidates) && candidates.length ? candidates : [candidate];
+  const sameClientPortCandidates = candidatePool.filter(item =>
+    numericPort(item?.clientPort ?? item?.port) === processClientPort
+  );
+  return sameClientPortCandidates.length === 1;
 }
 
 function enrichModelControlProfile(profile = {}) {
@@ -1671,10 +1722,16 @@ async function getLlamaInfo() {
     } catch (e) {}
 
     for (const proc of runningLlamaProcesses) {
-      const matchingConfig = llamaConfigs.find(candidate => configuredLlamaCandidateMatchesProcess(candidate, proc));
+      const matchingConfigs = llamaConfigs.filter(candidate =>
+        configuredLlamaCandidateMatchesProcess(candidate, proc, llamaConfigs)
+      );
+      const matchingConfig = matchingConfigs.length === 1 ? matchingConfigs[0] : null;
       const probeHost = matchingConfig ? matchingConfig.probeHost : '127.0.0.1';
       const server = `http://${probeHost}:${proc.port}`;
-      const clientPort = numericPort(matchingConfig?.clientPort) || clientPortForLlamaProcess(proc);
+      const processClientPort = clientPortForLlamaProcess(proc);
+      const clientPort = isUnslothStudioProcess(proc)
+        ? processClientPort
+        : numericPort(matchingConfig?.clientPort) || processClientPort;
       const candidate = {
         source: 'process',
         process: proc,
@@ -2326,8 +2383,12 @@ async function broadcastMetrics() {
   }
 }
 
+const isMainModule = Boolean(
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+);
+
 // Start broadcasting interval
-setInterval(broadcastMetrics, UPDATE_INTERVAL);
+if (isMainModule) setInterval(broadcastMetrics, UPDATE_INTERVAL);
 
 async function startDevServer() {
   // Create Vite dev server with middleware mode
@@ -2490,7 +2551,7 @@ async function startDevServer() {
   });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule) {
   startDevServer().catch(err => {
     console.error('Failed to start dev server:', err);
     process.exit(1);

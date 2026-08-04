@@ -64,13 +64,13 @@ test('prefers a live probed apiModel over stale configured metadata while keepin
   }, { status: 'running', apiModel: 'unsloth/DeepSeek-V4-Flash-0731-GGUF' });
 
   assert.equal(merged.llama.length, 1);
-  assert.equal(merged.llama[0].port, 18132);
-  assert.equal(merged.llama[0].clientPort, 18132);
+  assert.equal(merged.llama[0].port, UNSLOTH_STUDIO_CLIENT_PORT);
+  assert.equal(merged.llama[0].clientPort, UNSLOTH_STUDIO_CLIENT_PORT);
   assert.equal(merged.llama[0].backendPort, 36321);
   assert.equal(merged.llama[0].apiModel, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(merged.llama[0].displayName, 'DeepSeek V4 Flash 0731 Unsloth UD-IQ3_XXS');
   assert.equal(merged.llama[0].functionLabel, 'Configured card label');
-  assert.equal(merged.llama[0].connectionLabel, 'llama-server · :18131 · ctx 272K');
+  assert.equal(merged.llama[0].connectionLabel, 'llama-server · :56827 · ctx 272K');
 });
 
 test('does not present stale configured or process aliases when the live model probe is unavailable', () => {

@@ -11,6 +11,9 @@ import {
   parseRunningLlamaProcessLine,
   selectedLlamaPorts,
 } from '../llama-process-inventory.js';
+import {
+  configuredLlamaCandidateMatchesProcess,
+} from '../dev-server.js';
 
 test('identifies only the exact installed Studio llama-server path as Unsloth Studio', () => {
   assert.equal(
@@ -90,5 +93,93 @@ test('keeps diagnostics on the backend port while exposing the Studio client por
       backendPort: 18131,
       proxyPort: 18131,
     },
+  );
+});
+
+test('matches the configured Studio card by process identity before the shared client port', () => {
+  const candidates = [
+    {
+      clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+      env: {
+        API_MODEL_ID: 'studio-alpha',
+        MODEL_PATH: '/models/studio-alpha',
+      },
+      modelPath: '/models/studio-alpha',
+    },
+    {
+      clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+      env: {
+        API_MODEL_ID: 'studio-beta',
+        MODEL_PATH: '/models/studio-beta',
+      },
+      modelPath: '/models/studio-beta',
+    },
+  ];
+  const betaProcess = {
+    command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36322`,
+    clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+    port: 36322,
+    alias: 'studio-beta',
+    modelPath: '/models/studio-beta/model.gguf',
+  };
+
+  assert.equal(
+    configuredLlamaCandidateMatchesProcess(candidates[0], betaProcess, candidates),
+    false,
+  );
+  assert.equal(
+    configuredLlamaCandidateMatchesProcess(candidates[1], betaProcess, candidates),
+    true,
+  );
+});
+
+test('does not choose a Studio card solely from a shared client port when identity is ambiguous', () => {
+  const candidates = [
+    {
+      clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+      env: { API_MODEL_ID: 'studio-alpha', MODEL_PATH: '/models/studio-alpha' },
+      modelPath: '/models/studio-alpha',
+    },
+    {
+      clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+      env: { API_MODEL_ID: 'studio-beta', MODEL_PATH: '/models/studio-beta' },
+      modelPath: '/models/studio-beta',
+    },
+  ];
+  const unknownProcess = {
+    command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36323`,
+    clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+    port: 36323,
+    alias: 'studio-unknown',
+    modelPath: '/models/studio-unknown/model.gguf',
+  };
+
+  assert.equal(
+    candidates.some(candidate =>
+      configuredLlamaCandidateMatchesProcess(candidate, unknownProcess, candidates)),
+    false,
+  );
+});
+
+test('does not accept a reused PID when the configured Studio start time differs', () => {
+  const candidate = {
+    clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+    pid: 716619,
+    startedAt: 'Tue Aug  4 09:14:12 2026',
+    modelPath: '/models/studio-alpha',
+    env: { MODEL_PATH: '/models/studio-alpha' },
+  };
+  const reusedProcess = {
+    command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36324`,
+    clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
+    port: 36324,
+    pid: 716619,
+    startedAt: 'Tue Aug  4 10:14:12 2026',
+    modelPath: '/models/studio-unknown/model.gguf',
+  };
+
+  assert.equal(
+    configuredLlamaCandidateMatchesProcess(candidate, reusedProcess, [candidate]),
+    false,
   );
 });

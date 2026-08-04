@@ -100,9 +100,12 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
 
   const configured = next.llama[index];
   const status = details.status || 'running';
+  const studioProcess = isUnslothStudioProcess(process);
   const processClientPort = clientPortForLlamaProcess(process);
   const processBackendPort = backendPortForLlamaProcess(process);
-  const clientPort = numericPort(configured.clientPort || configured.port) || processClientPort || processBackendPort;
+  const clientPort = studioProcess
+    ? processClientPort || processBackendPort
+    : numericPort(configured.clientPort || configured.port) || processClientPort || processBackendPort;
   const displayPort = clientPort || processBackendPort;
   const liveApiModel = String(details.apiModel || '').trim() || null;
   next.llama[index] = {
@@ -121,7 +124,9 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     sizeGB: configured.sizeGB ?? details.sizeGB ?? null,
     ctx: configured.ctx || process.context,
     functionLabel: configured.functionLabel || 'Plain GGUF · OpenAI-compatible API',
-    connectionLabel: configured.connectionLabel || connectionLabelForProcess(process, displayPort)
+    connectionLabel: studioProcess
+      ? connectionLabelForProcess(process, displayPort)
+      : configured.connectionLabel || connectionLabelForProcess(process, displayPort)
   };
   return next;
 }
