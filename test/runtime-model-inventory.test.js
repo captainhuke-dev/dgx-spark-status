@@ -68,6 +68,28 @@ test('prefers a live probed apiModel over stale configured metadata while keepin
   assert.equal(merged.llama[0].connectionLabel, 'llama-server · :18131 · ctx 272K');
 });
 
+test('does not present stale configured or process aliases when the live model probe is unavailable', () => {
+  const merged = mergeRunningLlamaProcess({
+    llama: [{
+      apiModel: 'stale-configured-id',
+      servedModelName: 'stale-configured-id',
+      modelPath: '/models/deepseek',
+      port: 56827,
+      status: 'running'
+    }],
+    vllm: []
+  }, {
+    port: 56827,
+    alias: 'process-alias',
+    modelPath: '/models/deepseek/model.gguf',
+    context: 278528,
+    label: 'DeepSeek'
+  }, { status: 'loading', apiModel: null });
+
+  assert.equal(merged.llama[0].apiModel, null);
+  assert.equal(merged.llama[0].servedModelName, null);
+});
+
 test('keeps an unrelated running llama process as a separate inventory item', () => {
   const merged = mergeRunningLlamaProcess({
     llama: [{ apiModel: 'other-model', modelPath: '/models/other', port: 18000 }],

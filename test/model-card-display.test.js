@@ -37,6 +37,16 @@ test('modelIdValue does not invent an ID from an empty model name', () => {
   );
 });
 
+test('modelIdValue does not present configured aliases as live model IDs', () => {
+  assert.equal(
+    modelCardDisplay.modelIdValue({
+      servedModelName: 'stale-configured-id',
+      modelAlias: 'process-alias'
+    }),
+    ''
+  );
+});
+
 test('SystemMetrics renders full model ID rows with copy buttons for llama, vLLM, and ETC cards', () => {
   assert.match(
     dashboardUi,

@@ -4,10 +4,8 @@ function compactK(value) {
 }
 
 export function modelIdValue(model = {}) {
-  for (const value of [model.apiModel, model.servedModelName, model.modelAlias]) {
-    if (String(value || '').trim()) return String(value).trim();
-  }
-  return '';
+  const value = String(model.apiModel || '').trim();
+  return value;
 }
 
 export function modelBudgetLabel(model = {}) {

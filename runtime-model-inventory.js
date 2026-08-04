@@ -28,12 +28,12 @@ export function modelMatchesRunningLlamaProcess(model = {}, process = {}) {
 
 function processInventoryItem(process, { status, sizeGB, apiModel } = {}) {
   const resolvedStatus = status || 'running';
-  const resolvedModel = apiModel || process.alias || null;
+  const resolvedModel = String(apiModel || '').trim() || null;
   return {
     key: process.alias || process.label,
     name: process.label,
     displayName: process.label,
-    servedModelName: process.alias || null,
+    servedModelName: resolvedModel,
     functionLabel: 'Plain GGUF · OpenAI-compatible API',
     connectionLabel: `llama-server · :${process.port}${process.context ? ` · ctx ${(process.context / 1024).toFixed(0)}K` : ''}`,
     apiModel: resolvedModel,
@@ -71,6 +71,7 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
   const configured = next.llama[index];
   const status = details.status || 'running';
   const displayPort = configured.port || process.port;
+  const liveApiModel = String(details.apiModel || '').trim() || null;
   next.llama[index] = {
     ...configured,
     runtime: 'llama',
@@ -81,8 +82,8 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     host: configured.host || '127.0.0.1',
     path: configured.path || process.modelPath,
     modelPath: configured.modelPath || process.modelPath,
-    apiModel: details.apiModel || configured.apiModel || process.alias || null,
-    servedModelName: configured.servedModelName || details.apiModel || process.alias || null,
+    apiModel: liveApiModel,
+    servedModelName: liveApiModel,
     sizeGB: configured.sizeGB ?? details.sizeGB ?? null,
     ctx: configured.ctx || process.context,
     functionLabel: configured.functionLabel || 'Plain GGUF · OpenAI-compatible API',

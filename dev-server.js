@@ -1512,7 +1512,7 @@ async function getAvailableModels() {
         const ctx = envContextLength(env);
         let sizeGB = null;
         let status = 'stopped';
-        let apiModel = env.API_MODEL_ID || null;
+        let apiModel = null;
         let modelPath = env.MODEL_PATH || null;
 
         if (env.MODEL_PATH) {
@@ -1588,7 +1588,7 @@ async function getAvailableModels() {
       );
       const probe = await probeOpenAIModels(proc.port, configuredModel?.host || '127.0.0.1');
       const status = probe.status === 'running' ? 'running' : 'loading';
-      const apiModel = probe.models?.[0]?.id || proc.alias || null;
+      const apiModel = probe.models?.[0]?.id || null;
       let procSizeGB = null;
       if (proc.modelPath) {
         try {
@@ -1669,7 +1669,7 @@ async function getLlamaInfo() {
         env: matchingConfig?.env || {
           PORT: String(proc.port),
           MODEL_PATH: proc.modelPath || '',
-          API_MODEL_ID: proc.alias || ''
+          API_MODEL_ID: ''
         },
         cfg: matchingConfig?.cfg || null,
         port: proc.port,
@@ -1728,7 +1728,7 @@ async function getLlamaInfo() {
     let ctxSize = null;
     let quantFormat = null;
     let paramSize = null;
-    let liveApiModelId = String(selectedRuntime?.liveApiModelId || selectedRuntime?.env?.API_MODEL_ID || '').trim() || null;
+    let liveApiModelId = String(selectedRuntime?.liveApiModelId || '').trim() || null;
 
     if (healthRes.status === 'fulfilled') {
       healthy = healthRes.value.ok;
