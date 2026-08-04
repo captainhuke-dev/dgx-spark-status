@@ -13,6 +13,7 @@ import {
 import { readModelRuntimeDetails } from './model-runtime-details.js';
 import { classifyInventoryConfig } from './model-inventory-section.js';
 import { mergeRunningLlamaProcess, modelMatchesRunningLlamaProcess } from './runtime-model-inventory.js';
+import { selectPreferredLlamaRuntime } from './llama-runtime-selection.js';
 import { classifyManagedStatus, DEGRADED_RESIDENT_STATUS } from './model-control-state.js';
 import { readManagedProfileComponents } from './managed-profile-components.js';
 import { stopAllManagedModels } from './model-control-operations.js';
@@ -1617,53 +1618,101 @@ async function getLlamaInfo() {
     let llamaPort = 8001;
     let llamaConfig = null;
     const runningLlamaProcesses = await getRunningLlamaProcesses();
+    const llamaConfigs = [];
+    const configuredCandidates = [];
+    const liveProcessCandidates = [];
 
     try {
       const newline = String.fromCharCode(10);
       const { stdout: cfgOut } = await execAsync("ls -1 /etc/vllm/models/*.env 2>/dev/null || true");
-      const llamaConfigs = [];
       for (const cfg of cfgOut.trim().split(newline).filter(Boolean)) {
         const env = parseEnvText(readFileSync(cfg, 'utf8'));
         if (classifyEnvRuntime(env) !== 'llama' || !env.PORT) continue;
-        llamaConfigs.push({ env, cfg, port: parseInt(env.PORT, 10) });
-      }
+        const port = parseInt(env.PORT, 10);
+        const probeHost = envProbeHost(env);
+        const server = `http://${probeHost}:${port}`;
+        const candidate = {
+          source: 'configured',
+          env,
+          cfg,
+          port,
+          probeHost,
+          server,
+          healthy: false,
+          liveApiModelId: '',
+          modelPath: env.MODEL_PATH || null
+        };
+        llamaConfigs.push(candidate);
+        configuredCandidates.push(candidate);
 
-      for (const candidate of llamaConfigs) {
-        if (!llamaConfig) {
-          llamaConfig = { env: candidate.env, cfg: candidate.cfg };
-          llamaPort = candidate.port;
-          llamaServer = `http://${envProbeHost(candidate.env)}:${llamaPort}`;
-        }
         try {
-          const modelsRes = await fetch(`http://${envProbeHost(candidate.env)}:${candidate.port}/v1/models`, { signal: AbortSignal.timeout(1000) });
+          const modelsRes = await fetch(`${server}/v1/models`, { signal: AbortSignal.timeout(1000) });
           if (!modelsRes.ok) continue;
           const data = await modelsRes.json();
-          if (data?.data?.[0]?.id) {
-            llamaConfig = { env: candidate.env, cfg: candidate.cfg };
-            llamaPort = candidate.port;
-            llamaServer = `http://${envProbeHost(candidate.env)}:${llamaPort}`;
-            break;
+          const firstModel = data?.data?.[0] || null;
+          if (firstModel?.id) {
+            candidate.healthy = true;
+            candidate.liveApiModelId = firstModel.id;
+            candidate.modelPath = firstModel.root || candidate.modelPath;
           }
         } catch (e) {}
       }
     } catch (e) {}
 
     for (const proc of runningLlamaProcesses) {
+      const matchingConfig = llamaConfigs.find(candidate => Number(candidate.port) === Number(proc.port));
+      const probeHost = matchingConfig ? matchingConfig.probeHost : '127.0.0.1';
+      const server = `http://${probeHost}:${proc.port}`;
+      const candidate = {
+        source: 'process',
+        process: proc,
+        env: matchingConfig?.env || {
+          PORT: String(proc.port),
+          MODEL_PATH: proc.modelPath || '',
+          API_MODEL_ID: proc.alias || ''
+        },
+        cfg: matchingConfig?.cfg || null,
+        port: proc.port,
+        probeHost,
+        server,
+        healthy: false,
+        liveApiModelId: '',
+        modelPath: proc.modelPath || matchingConfig?.modelPath || null
+      };
+      liveProcessCandidates.push(candidate);
+
       try {
-        const matchingConfig = llamaConfigs.find(candidate => Number(candidate.port) === Number(proc.port));
-        const probeHost = matchingConfig ? envProbeHost(matchingConfig.env) : '127.0.0.1';
-        const modelsRes = await fetch(`http://${probeHost}:${proc.port}/v1/models`, { signal: AbortSignal.timeout(1000) });
+        const modelsRes = await fetch(`${server}/v1/models`, { signal: AbortSignal.timeout(1000) });
         if (!modelsRes.ok) continue;
         const data = await modelsRes.json();
-        if (data?.data?.[0]?.id && modelApiLooksLikeLlama(data)) {
-          llamaPort = proc.port;
-          llamaServer = `http://${probeHost}:${llamaPort}`;
-          if (!llamaConfig || Number(llamaConfig?.env?.PORT || 0) !== Number(proc.port)) {
-            llamaConfig = { env: { PORT: String(proc.port), MODEL_PATH: proc.modelPath || '', API_MODEL_ID: proc.alias || data.data[0].id }, cfg: null };
+        const firstModel = data?.data?.[0] || null;
+        if (firstModel?.id && modelApiLooksLikeLlama(data)) {
+          candidate.healthy = true;
+          candidate.liveApiModelId = firstModel.id;
+          candidate.modelPath = firstModel.root || candidate.modelPath;
+          if (!matchingConfig) {
+            candidate.env = {
+              PORT: String(proc.port),
+              MODEL_PATH: proc.modelPath || candidate.modelPath || '',
+              API_MODEL_ID: firstModel.id
+            };
           }
-          break;
         }
       } catch (e) {}
+    }
+
+    const selectedRuntime = selectPreferredLlamaRuntime({
+      configuredCandidates,
+      liveProcessCandidates
+    });
+
+    if (selectedRuntime) {
+      llamaPort = selectedRuntime.port;
+      llamaServer = selectedRuntime.server;
+      llamaConfig = {
+        env: selectedRuntime.env,
+        cfg: selectedRuntime.cfg
+      };
     }
 
     const [healthRes, propsRes, slotsRes] = await Promise.allSettled([
@@ -1679,6 +1728,7 @@ async function getLlamaInfo() {
     let ctxSize = null;
     let quantFormat = null;
     let paramSize = null;
+    let liveApiModelId = String(selectedRuntime?.liveApiModelId || selectedRuntime?.env?.API_MODEL_ID || '').trim() || null;
 
     if (healthRes.status === 'fulfilled') {
       healthy = healthRes.value.ok;
@@ -1720,6 +1770,7 @@ async function getLlamaInfo() {
         const modelId = firstModel?.id || '';
         if (modelId) {
           healthy = true;
+          liveApiModelId = modelId;
           const parsed = parseModelMeta(modelId);
           model = parsed.model || model;
           quantFormat = parsed.quantFormat || quantFormat;
@@ -1737,7 +1788,10 @@ async function getLlamaInfo() {
 
     // Fallback to running process if API isn't ready yet.
     try {
-      const proc = runningLlamaProcesses[0] || null;
+      const proc = selectedRuntime?.process ||
+        runningLlamaProcesses.find(item => Number(item.port || 0) === Number(llamaPort || 0)) ||
+        runningLlamaProcesses[0] ||
+        null;
       const cmd = proc?.command || '';
       if (proc && cmd) {
         processRunning = true;
@@ -1779,6 +1833,7 @@ async function getLlamaInfo() {
       available: status !== 'stopped',
       status,
       model,
+      apiModel: liveApiModelId,
       ctxSize,
       quantFormat,
       paramSize,
