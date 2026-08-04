@@ -201,7 +201,11 @@ class BackendResolver:
         return resolved
 
     def _is_candidate_process(self, process: ProcessRecord) -> bool:
-        return os.path.normpath(process.executable) == self._studio_llama_server
+        expected_executable = os.path.realpath(
+            os.path.normpath(self._studio_llama_server)
+        )
+        actual_executable = os.path.realpath(os.path.normpath(process.executable))
+        return actual_executable == expected_executable
 
     def _has_studio_ancestor(
         self,
