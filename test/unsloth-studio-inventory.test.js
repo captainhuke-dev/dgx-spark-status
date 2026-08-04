@@ -36,6 +36,22 @@ test('identifies only the exact installed Studio llama-server path as Unsloth St
   );
 });
 
+test('rejects a non-Studio executable that only mentions the Studio launcher in an argument', () => {
+  const spoofedCommand = `/opt/llama.cpp/llama-server --label ${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36321`;
+
+  assert.equal(
+    isUnslothStudioProcess({ command: spoofedCommand }),
+    false,
+  );
+
+  const process = parseRunningLlamaProcessLine(
+    `716620 716100 Tue Aug  4 09:14:12 2026 ${spoofedCommand}`,
+  );
+  assert.equal(process.executable, '/opt/llama.cpp/llama-server');
+  assert.equal(process.isUnslothStudio, false);
+  assert.equal(process.clientPort, 36321);
+});
+
 test('maps Studio processes to the fixed client port while leaving other llama processes unchanged', () => {
   assert.equal(
     clientPortForLlamaProcess({

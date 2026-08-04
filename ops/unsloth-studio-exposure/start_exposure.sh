@@ -12,13 +12,17 @@ LAN_BIND_ADDRESS="192.168.0.21"
 GUARD_TARGET="127.0.0.1:56828"
 GUARD_PORT="56828"
 PUBLIC_PORT="56827"
+SYSTEMCTL_BIN="${DGX_UNSLOTH_EXPOSURE_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 GUARD_STARTED="0"
 LAN_STARTED="0"
+GUARD_WAS_ACTIVE="0"
+LAN_WAS_ACTIVE="0"
+PREFLIGHT_ONLY="0"
 
 systemctl_user() {
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
-  /usr/bin/systemctl --user "$@"
+  "${SYSTEMCTL_BIN}" --user "$@"
 }
 
 cleanup_on_error() {
@@ -60,6 +64,10 @@ parse_args() {
         GUARD_TARGET="$2"
         GUARD_PORT="${GUARD_TARGET##*:}"
         shift 2
+        ;;
+      --preflight-only)
+        PREFLIGHT_ONLY="1"
+        shift
         ;;
       *)
         echo "unknown argument: $1" >&2
@@ -153,26 +161,46 @@ assert_listener_present() {
   fi
 }
 
-main() {
-  parse_args "$@"
-  mkdir -p "$(dirname "${STATE_FILE}")" "${EVIDENCE_DIR}"
-  trap cleanup_on_error EXIT
-  local route_helper
-  route_helper="$(resolve_route_helper)"
-
+preflight_exposure() {
+  local route_helper="$1"
   python3 "${route_helper}" preflight \
     --state-file "${STATE_FILE}" \
     --evidence-dir "${EVIDENCE_DIR}"
-
+  require_lan_address
   assert_listener_available_or_owned "127.0.0.1" "${GUARD_PORT}" "${GUARD_UNIT_NAME}"
+  assert_listener_available_or_owned "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}" "${LAN_PROXY_UNIT_NAME}"
+}
+
+main() {
+  parse_args "$@"
+  mkdir -p "$(dirname "${STATE_FILE}")" "${EVIDENCE_DIR}"
+  local route_helper
+  route_helper="$(resolve_route_helper)"
+
+  preflight_exposure "${route_helper}"
+  if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then
+    return 0
+  fi
+
+  trap cleanup_on_error EXIT
+
+  if systemctl_user is-active --quiet "${GUARD_UNIT_NAME}"; then
+    GUARD_WAS_ACTIVE="1"
+  fi
+  if systemctl_user is-active --quiet "${LAN_PROXY_UNIT_NAME}"; then
+    LAN_WAS_ACTIVE="1"
+  fi
+
   systemctl_user start "${GUARD_UNIT_NAME}"
-  GUARD_STARTED="1"
+  if [[ "${GUARD_WAS_ACTIVE}" == "0" ]]; then
+    GUARD_STARTED="1"
+  fi
   assert_listener_present "127.0.0.1" "${GUARD_PORT}"
 
-  require_lan_address
-  assert_listener_available_or_owned "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}" "${LAN_PROXY_UNIT_NAME}"
   systemctl_user start "${LAN_PROXY_UNIT_NAME}"
-  LAN_STARTED="1"
+  if [[ "${LAN_WAS_ACTIVE}" == "0" ]]; then
+    LAN_STARTED="1"
+  fi
   assert_listener_present "${LAN_BIND_ADDRESS}" "${PUBLIC_PORT}"
 
   python3 "${route_helper}" ensure \

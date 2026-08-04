@@ -223,14 +223,11 @@ class BackendResolver:
             parent = process_by_pid.get(current_pid)
             if parent is None:
                 return False
-            if (
-                _path_within_root(parent.executable, self._studio_root)
-                or _is_studio_launcher_command(
-                    parent.executable,
-                    parent.command,
-                    self._studio_interpreter,
-                    self._studio_launcher,
-                )
+            if _is_studio_launcher_command(
+                parent.executable,
+                parent.command,
+                self._studio_interpreter,
+                self._studio_launcher,
             ):
                 return True
             current_pid = parent.ppid
@@ -358,9 +355,3 @@ def _extract_single_model_id(payload) -> str | None:
     if len(distinct_ids) > 1:
         raise BackendAmbiguous('Multiple live model IDs reported by backend.')
     return next(iter(distinct_ids))
-
-
-def _path_within_root(path: str, root: str) -> bool:
-    normalized_path = os.path.normpath(path)
-    normalized_root = os.path.normpath(root)
-    return normalized_path == normalized_root or normalized_path.startswith(normalized_root + os.sep)

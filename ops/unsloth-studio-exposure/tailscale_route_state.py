@@ -308,6 +308,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == 'ensure':
         classification = ensure_tcp_route(serve_document, runner=runner)
+        state = _read_state(state_file)
+        route_was_owned = (
+            state.get('ROUTE_CREATED') == '1'
+            and state.get('ROUTE_REMOVED', '0') != '1'
+            and state.get('ROUTE_PORT') == str(ROUTE_PORT)
+            and _strip_target_scheme(state.get('ROUTE_TARGET', ''))
+            == _strip_target_scheme(EXPECTED_TARGET)
+        )
         if classification.status == 'absent':
             _write_state(
                 state_file,
@@ -315,6 +323,16 @@ def main(argv: list[str] | None = None) -> int:
                 ROUTE_PREEXISTING='0',
                 ROUTE_PORT=str(ROUTE_PORT),
                 ROUTE_TARGET=EXPECTED_TARGET,
+                ROUTE_REMOVED='0',
+            )
+        elif route_was_owned:
+            _write_state(
+                state_file,
+                ROUTE_CREATED='1',
+                ROUTE_PREEXISTING='0',
+                ROUTE_PORT=str(ROUTE_PORT),
+                ROUTE_TARGET=EXPECTED_TARGET,
+                ROUTE_REMOVED='0',
             )
         else:
             _write_state(
@@ -323,6 +341,7 @@ def main(argv: list[str] | None = None) -> int:
                 ROUTE_PREEXISTING='1',
                 ROUTE_PORT=str(ROUTE_PORT),
                 ROUTE_TARGET=EXPECTED_TARGET,
+                ROUTE_REMOVED='0',
             )
         return 0
 

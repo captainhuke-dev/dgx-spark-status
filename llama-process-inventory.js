@@ -19,22 +19,25 @@ export function parseRunningLlamaProcessLine(line = '') {
   if (!match) return null;
 
   const [, pidText, ppidText, startedAt, command] = match;
+  const executable = command.trim().split(/\s+/, 1)[0] || '';
   const port = numericPort(parseCommandArg(command, ['--port', '-p']));
   const modelPath = parseCommandArg(command, ['--model', '-m']);
   const alias = parseCommandArg(command, ['--alias']);
   const context = numericPort(parseCommandArg(command, ['--ctx-size', '-c']));
   const baseName = modelPath ? modelPath.split('/').filter(Boolean).pop() : '';
-  const clientPort = clientPortForLlamaProcess({ command, port });
+  const processIdentity = { executable, command, port };
+  const clientPort = clientPortForLlamaProcess(processIdentity);
 
   return {
     pid: Number(pidText),
     ppid: Number(ppidText),
     startedAt,
+    executable,
     command,
     port,
     clientPort,
     backendPort: port,
-    isUnslothStudio: isUnslothStudioProcess({ command }),
+    isUnslothStudio: isUnslothStudioProcess(processIdentity),
     modelPath,
     alias,
     context,

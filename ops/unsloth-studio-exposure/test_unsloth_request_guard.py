@@ -6,6 +6,7 @@ import json
 import pathlib
 import socket
 import sys
+import threading
 import types
 import unittest
 from unittest import mock
@@ -108,6 +109,37 @@ class FakeUpstreamConnection:
         self.closed = True
 
 
+class BlockingUpstreamConnection(FakeUpstreamConnection):
+    def __init__(self, started, release):
+        super().__init__(response=FakeUpstreamResponse(body=b'first'))
+        self.started = started
+        self.release = release
+
+    def request(self, method, url, body=None, headers=None):
+        super().request(method, url, body=body, headers=headers)
+        self.started.set()
+        if not self.release.wait(2):
+            raise TimeoutError('test did not release blocked request')
+
+
+class TimeoutBodyStream:
+    def read(self, size=-1):
+        raise socket.timeout('request body timed out')
+
+
+class RecordingHandlerSocket:
+    def __init__(self):
+        self.timeout = None
+        self.set_timeout_calls = []
+
+    def gettimeout(self):
+        return self.timeout
+
+    def settimeout(self, value):
+        self.timeout = value
+        self.set_timeout_calls.append(value)
+
+
 class RecordingConnectionFactory:
     def __init__(self, *connections):
         self._connections = list(connections) or [FakeUpstreamConnection()]
@@ -129,6 +161,8 @@ class HandlerHarnessMixin:
         path='/v1/models',
         headers=None,
         body=b'',
+        body_stream=None,
+        handler_socket=None,
         resolver=None,
         connection_factory=None,
         upstream_response=None,
@@ -158,8 +192,9 @@ class HandlerHarnessMixin:
                 self.headers = email.message.Message()
                 for key, value in (headers or {}).items():
                     self.headers[key] = value
-                self.rfile = io.BytesIO(body)
+                self.rfile = body_stream or io.BytesIO(body)
                 self.wfile = io.BytesIO()
+                self.connection = handler_socket or RecordingHandlerSocket()
                 self.server = types.SimpleNamespace(
                     guard_config=config,
                     resolver=resolver,
@@ -189,6 +224,16 @@ class HandlerHarnessMixin:
 
     def error_payload(self, handler):
         return json.loads(handler.wfile.getvalue().decode('utf-8'))
+
+    def read_socket_response(self, client):
+        client.settimeout(1)
+        chunks = []
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b''.join(chunks)
 
 
 class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
@@ -250,6 +295,36 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
 
         with self.assertRaisesRegex(ValueError, 'max_output_budget'):
             guard.GuardConfig(max_output_budget=65536)
+
+    def test_guard_config_accepts_configurable_body_timeout_and_concurrency_limit(self):
+        guard = load_guard_module()
+
+        config = guard.GuardConfig(
+            request_body_timeout_seconds=0.25,
+            max_concurrent_requests=2,
+        )
+
+        self.assertEqual(0.25, config.request_body_timeout_seconds)
+        self.assertEqual(2, config.max_concurrent_requests)
+
+    def test_guard_config_rejects_nonpositive_body_timeout_and_concurrency_limit(self):
+        guard = load_guard_module()
+
+        with self.assertRaisesRegex(ValueError, 'request_body_timeout_seconds'):
+            guard.GuardConfig(request_body_timeout_seconds=0)
+        with self.assertRaisesRegex(ValueError, 'max_concurrent_requests'):
+            guard.GuardConfig(max_concurrent_requests=0)
+
+    def test_parse_args_accepts_body_timeout_and_concurrency_limit(self):
+        guard = load_guard_module()
+
+        args = guard.parse_args([
+            '--request-body-timeout-seconds', '0.25',
+            '--max-concurrent-requests', '2',
+        ])
+
+        self.assertEqual(0.25, args.request_body_timeout_seconds)
+        self.assertEqual(2, args.max_concurrent_requests)
 
     def test_parse_args_rejects_bind_host_override(self):
         guard = load_guard_module()
@@ -507,6 +582,97 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
         self.assertIsNone(connection.request_call)
         payload = self.error_payload(handler)
         self.assertEqual(payload['error']['code'], 'body_too_large')
+
+    def test_returns_stable_error_when_request_body_read_times_out(self):
+        guard = load_guard_module()
+        handler_socket = RecordingHandlerSocket()
+        config = guard.GuardConfig(request_body_timeout_seconds=0.25)
+        handler, resolver, _, connection = self.build_handler(
+            guard,
+            method='POST',
+            path='/v1/chat/completions',
+            headers={'Content-Length': '5'},
+            body_stream=TimeoutBodyStream(),
+            handler_socket=handler_socket,
+            config=config,
+        )
+
+        handler.do_POST()
+
+        self.assertEqual(408, handler.response_code)
+        self.assertEqual('request_body_timeout', self.error_payload(handler)['error']['code'])
+        self.assertEqual([0.25, None], handler_socket.set_timeout_calls)
+        self.assertEqual(0, resolver.resolve_calls)
+        self.assertIsNone(connection.request_call)
+
+    def test_returns_incomplete_body_when_client_closes_before_content_length(self):
+        guard = load_guard_module()
+        handler, resolver, _, connection = self.build_handler(
+            guard,
+            method='POST',
+            path='/v1/chat/completions',
+            headers={'Content-Length': '5'},
+            body=b'{}',
+        )
+
+        handler.do_POST()
+
+        self.assertEqual(400, handler.response_code)
+        self.assertEqual('incomplete_body', self.error_payload(handler)['error']['code'])
+        self.assertEqual(0, resolver.resolve_calls)
+        self.assertIsNone(connection.request_call)
+
+    def test_rejects_request_above_concurrency_limit_with_stable_error(self):
+        guard = load_guard_module()
+        started = threading.Event()
+        release = threading.Event()
+        first_connection = BlockingUpstreamConnection(started, release)
+        second_connection = FakeUpstreamConnection(
+            response=FakeUpstreamResponse(body=b'second')
+        )
+        connection_factory = RecordingConnectionFactory(
+            first_connection,
+            second_connection,
+        )
+        server = guard._create_server(
+            guard.GuardConfig(max_concurrent_requests=1),
+            resolver=FakeResolver(),
+            server_address=('127.0.0.1', 0),
+            bind_and_activate=True,
+            connection_factory=connection_factory,
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        first_client = None
+        second_client = None
+        try:
+            address = server.socket.getsockname()
+            first_client = socket.create_connection(address, timeout=1)
+            first_client.sendall(
+                b'GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+            )
+            self.assertTrue(started.wait(1), 'first request never occupied the server')
+
+            second_client = socket.create_connection(address, timeout=1)
+            second_client.sendall(
+                b'GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+            )
+            second_response = self.read_socket_response(second_client)
+
+            self.assertIn(b'HTTP/1.1 503', second_response)
+            payload = json.loads(second_response.split(b'\r\n\r\n', 1)[1])
+            self.assertEqual('server_busy', payload['error']['code'])
+            self.assertEqual(1, len(connection_factory.calls))
+        finally:
+            release.set()
+            if first_client is not None:
+                self.read_socket_response(first_client)
+                first_client.close()
+            if second_client is not None:
+                second_client.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(1)
 
     def test_returns_503_when_no_backend(self):
         guard = load_guard_module()

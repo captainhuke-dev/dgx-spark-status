@@ -1,10 +1,14 @@
 import copy
 import configparser
 import importlib
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 RUNTIME_DIR = pathlib.Path(__file__).resolve().parent
@@ -79,6 +83,213 @@ class RecordingRunner:
 
 
 class PackagingSurfaceTests(unittest.TestCase):
+    def run_start_with_fake_host(self, *, units_preexisting):
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            fake_bin = temp_root / 'bin'
+            active_root = temp_root / 'active'
+            runtime_root = temp_root / 'runtime'
+            unit_root = temp_root / 'units'
+            state_file = temp_root / 'state' / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            systemctl_log = temp_root / 'systemctl.log'
+            fake_bin.mkdir()
+            active_root.mkdir()
+            runtime_root.mkdir()
+            unit_root.mkdir()
+
+            if units_preexisting:
+                (active_root / 'dgx-unsloth-guard.service').touch()
+                (active_root / 'dgx-unsloth-lan-proxy.service').touch()
+
+            fake_systemctl = fake_bin / 'systemctl'
+            fake_systemctl.write_text(f'''#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> "{systemctl_log}"
+if [[ "$1" == "--user" ]]; then shift; fi
+command="$1"
+unit="${{@: -1}}"
+case "${{command}}" in
+  is-active)
+    [[ -f "{active_root}/${{unit}}" ]]
+    ;;
+  show)
+    if [[ -f "{active_root}/${{unit}}" ]]; then
+      [[ "${{unit}}" == "dgx-unsloth-guard.service" ]] && printf '101\\n' || printf '102\\n'
+    else
+      printf '0\\n'
+    fi
+    ;;
+  start)
+    touch "{active_root}/${{unit}}"
+    ;;
+  stop)
+    rm -f "{active_root}/${{unit}}"
+    ;;
+esac
+''')
+            fake_systemctl.chmod(0o755)
+
+            fake_ip = fake_bin / 'ip'
+            fake_ip.write_text(
+                '#!/usr/bin/env bash\n'
+                "printf '2: eth0    inet 192.168.0.21/24 scope global eth0\\n'\n"
+            )
+            fake_ip.chmod(0o755)
+
+            fake_ss = fake_bin / 'ss'
+            fake_ss.write_text(f'''#!/usr/bin/env bash
+if [[ -f "{active_root}/dgx-unsloth-guard.service" ]]; then
+  printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:(("python3",pid=101,fd=3))\\n'
+fi
+if [[ -f "{active_root}/dgx-unsloth-lan-proxy.service" ]]; then
+  printf 'LISTEN 0 128 192.168.0.21:56827 0.0.0.0:* users:(("socat",pid=102,fd=3))\\n'
+fi
+''')
+            fake_ss.chmod(0o755)
+
+            route_helper = runtime_root / 'tailscale_route_state.py'
+            route_helper.write_text(
+                '#!/usr/bin/env python3\n'
+                'import sys\n'
+                "raise SystemExit(1 if sys.argv[1] == 'ensure' else 0)\n"
+            )
+            route_helper.chmod(0o755)
+
+            safe_start = temp_root / 'start_exposure.sh'
+            safe_start.write_text(
+                START_SCRIPT.read_text().replace('/usr/bin/systemctl', str(fake_systemctl))
+            )
+            safe_start.chmod(0o755)
+
+            env = os.environ.copy()
+            env['PATH'] = f'{fake_bin}:{env["PATH"]}'
+            env['DGX_UNSLOTH_EXPOSURE_SYSTEMCTL_BIN'] = str(fake_systemctl)
+            result = subprocess.run(
+                [
+                    str(safe_start),
+                    '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                    '--runtime-root', str(runtime_root),
+                    '--user-unit-root', str(unit_root),
+                    '--lan-address', LAN_ADDRESS,
+                    '--guard-target', GUARD_TARGET,
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            calls = systemctl_log.read_text().splitlines()
+            active_units = sorted(path.name for path in active_root.iterdir())
+            return result, calls, active_units
+
+    def run_install_with_fake_preflight(
+        self,
+        *,
+        route_conflict=False,
+        listener_conflict=False,
+        runs=1,
+    ):
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            package_root = temp_root / 'package'
+            fake_bin = temp_root / 'bin'
+            runtime_root = temp_root / 'installed-runtime'
+            unit_root = temp_root / 'installed-units'
+            state_root = temp_root / 'state'
+            active_root = temp_root / 'active'
+            systemctl_log = temp_root / 'systemctl.log'
+            shutil.copytree(RUNTIME_DIR, package_root)
+            fake_bin.mkdir()
+            active_root.mkdir()
+
+            fake_systemctl = fake_bin / 'systemctl'
+            fake_systemctl.write_text(f'''#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{systemctl_log}"
+if [[ "$1" == "--user" ]]; then shift; fi
+command="$1"
+unit="${{@: -1}}"
+case "${{command}}" in
+  is-active) [[ -f "{active_root}/${{unit}}" ]] ;;
+  show)
+    if [[ -f "{active_root}/${{unit}}" ]]; then
+      [[ "${{unit}}" == "dgx-unsloth-guard.service" ]] && printf '101\\n' || printf '102\\n'
+    else
+      printf '0\\n'
+    fi
+    ;;
+  start) touch "{active_root}/${{unit}}" ;;
+  stop) rm -f "{active_root}/${{unit}}" ;;
+esac
+exit 0
+''')
+            fake_systemctl.chmod(0o755)
+
+            fake_ip = fake_bin / 'ip'
+            fake_ip.write_text(
+                '#!/usr/bin/env bash\n'
+                "printf '2: eth0    inet 192.168.0.21/24 scope global eth0\\n'\n"
+            )
+            fake_ip.chmod(0o755)
+
+            fake_ss = fake_bin / 'ss'
+            if listener_conflict:
+                fake_ss.write_text(
+                    '#!/usr/bin/env bash\n'
+                    "printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:((\"evil\",pid=999,fd=3))\\n'\n"
+                )
+            else:
+                fake_ss.write_text(f'''#!/usr/bin/env bash
+if [[ -f "{active_root}/dgx-unsloth-guard.service" ]]; then
+  printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:(("python3",pid=101,fd=3))\\n'
+fi
+if [[ -f "{active_root}/dgx-unsloth-lan-proxy.service" ]]; then
+  printf 'LISTEN 0 128 192.168.0.21:56827 0.0.0.0:* users:(("socat",pid=102,fd=3))\\n'
+fi
+''')
+            fake_ss.chmod(0o755)
+
+            route_helper = package_root / 'tailscale_route_state.py'
+            route_helper.write_text(
+                '#!/usr/bin/env python3\n'
+                'import sys\n'
+                + (
+                    "raise SystemExit(1 if sys.argv[1] == 'preflight' else 0)\n"
+                    if route_conflict else 'raise SystemExit(0)\n'
+                )
+            )
+            route_helper.chmod(0o755)
+
+            install_script = package_root / 'install_exposure.sh'
+            install_script.write_text(
+                install_script.read_text().replace('/usr/bin/systemctl', str(fake_systemctl))
+            )
+
+            env = os.environ.copy()
+            env.update({
+                'PATH': f'{fake_bin}:{env["PATH"]}',
+                'DGX_UNSLOTH_EXPOSURE_SYSTEMCTL_BIN': str(fake_systemctl),
+                'DGX_UNSLOTH_EXPOSURE_RUNTIME_ROOT': str(runtime_root),
+                'DGX_UNSLOTH_EXPOSURE_USER_UNIT_ROOT': str(unit_root),
+                'DGX_UNSLOTH_EXPOSURE_STATE_ROOT': str(state_root),
+            })
+            results = [
+                subprocess.run(
+                    [str(install_script)],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    check=False,
+                )
+                for _ in range(runs)
+            ]
+            calls = (
+                systemctl_log.read_text().splitlines()
+                if systemctl_log.exists() else []
+            )
+            return results, runtime_root.exists(), unit_root.exists(), calls
+
     def test_units_keep_host_inspection_compatible_hardening(self):
         guard_unit = configparser.ConfigParser(interpolation=None)
         guard_unit.read(GUARD_UNIT_PATH)
@@ -160,6 +371,62 @@ class PackagingSurfaceTests(unittest.TestCase):
         self.assertIn('route_helper="${RUNTIME_ROOT}/tailscale_route_state.py"', text)
         self.assertIn('route_helper="${SCRIPT_DIR}/tailscale_route_state.py"', text)
         self.assertIn('if [[ -n "${route_helper}" && -x "${route_helper}" ]]', text)
+
+    def test_failed_repeated_start_does_not_stop_preexisting_units(self):
+        result, calls, active_units = self.run_start_with_fake_host(
+            units_preexisting=True,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('--user start dgx-unsloth-guard.service', calls)
+        self.assertIn('--user start dgx-unsloth-lan-proxy.service', calls)
+        self.assertNotIn('--user stop dgx-unsloth-guard.service', calls)
+        self.assertNotIn('--user stop dgx-unsloth-lan-proxy.service', calls)
+        self.assertEqual(
+            ['dgx-unsloth-guard.service', 'dgx-unsloth-lan-proxy.service'],
+            active_units,
+        )
+
+    def test_failed_initial_start_stops_only_units_started_by_that_invocation(self):
+        result, calls, active_units = self.run_start_with_fake_host(
+            units_preexisting=False,
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('--user stop dgx-unsloth-guard.service', calls)
+        self.assertIn('--user stop dgx-unsloth-lan-proxy.service', calls)
+        self.assertEqual([], active_units)
+
+    def test_install_route_conflict_preflight_does_not_mutate_files_or_enablement(self):
+        results, runtime_exists, units_exist, calls = self.run_install_with_fake_preflight(
+            route_conflict=True,
+        )
+
+        self.assertNotEqual(0, results[0].returncode)
+        self.assertFalse(runtime_exists)
+        self.assertFalse(units_exist)
+        self.assertEqual([], calls)
+
+    def test_install_listener_conflict_preflight_does_not_mutate_files_or_enablement(self):
+        results, runtime_exists, units_exist, calls = self.run_install_with_fake_preflight(
+            listener_conflict=True,
+        )
+
+        self.assertNotEqual(0, results[0].returncode)
+        self.assertFalse(runtime_exists)
+        self.assertFalse(units_exist)
+        self.assertTrue(all(' show ' in f' {call} ' for call in calls))
+
+    def test_repeated_successful_install_is_idempotent(self):
+        results, runtime_exists, units_exist, calls = self.run_install_with_fake_preflight(
+            runs=2,
+        )
+
+        self.assertEqual([0, 0], [result.returncode for result in results])
+        self.assertTrue(runtime_exists)
+        self.assertTrue(units_exist)
+        self.assertNotIn('--user stop dgx-unsloth-guard.service', calls)
+        self.assertNotIn('--user stop dgx-unsloth-lan-proxy.service', calls)
 
 
 class TailscaleRouteStateTests(unittest.TestCase):
@@ -254,6 +521,91 @@ class TailscaleRouteStateTests(unittest.TestCase):
             [['tailscale', 'serve', '--bg', '--tcp=56827', '127.0.0.1:56828']],
             runner.calls,
         )
+
+    def test_repeated_ensure_preserves_created_route_ownership_for_remove(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        absent = self.serve_status()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[absent, matching, matching],
+                ),
+                mock.patch.object(
+                    route_state,
+                    'SubprocessRunner',
+                    return_value=runner,
+                ),
+            ):
+                route_state.main([
+                    'ensure', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+                route_state.main([
+                    'ensure', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+                route_state.main([
+                    'remove', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+
+            self.assertEqual(
+                [
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', GUARD_TARGET],
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', 'off'],
+                ],
+                runner.calls,
+            )
+            state = route_state._read_state(state_file)
+            self.assertEqual('1', state['ROUTE_CREATED'])
+            self.assertEqual('0', state['ROUTE_PREEXISTING'])
+            self.assertEqual('1', state['ROUTE_REMOVED'])
+
+    def test_matching_preexisting_route_is_not_claimed_or_removed(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[matching, matching],
+                ),
+                mock.patch.object(
+                    route_state,
+                    'SubprocessRunner',
+                    return_value=runner,
+                ),
+            ):
+                route_state.main([
+                    'ensure', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+                route_state.main([
+                    'remove', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+
+            self.assertEqual([], runner.calls)
+            state = route_state._read_state(state_file)
+            self.assertEqual('0', state['ROUTE_CREATED'])
+            self.assertEqual('1', state['ROUTE_PREEXISTING'])
+            self.assertEqual('0', state['ROUTE_REMOVED'])
 
     def test_conflict_raises_before_any_add_or_remove_command_executes(self):
         route_state = load_route_state_module()

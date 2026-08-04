@@ -4,6 +4,7 @@ import argparse
 import http.client
 import json
 import socket
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
@@ -18,6 +19,8 @@ DEFAULT_BIND_PORT = 56828
 DEFAULT_MAX_OUTPUT_BUDGET = 32768
 DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
 DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 30.0
+DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS = 10.0
+DEFAULT_MAX_CONCURRENT_REQUESTS = 8
 RESPONSE_STREAM_CHUNK_SIZE = 64 * 1024
 ERROR_MESSAGE_LIMIT = 200
 HOP_BY_HOP_HEADERS = {
@@ -46,6 +49,8 @@ class GuardConfig:
     max_output_budget: int = DEFAULT_MAX_OUTPUT_BUDGET
     max_request_body_bytes: int = DEFAULT_MAX_REQUEST_BODY_BYTES
     upstream_timeout_seconds: float = DEFAULT_UPSTREAM_TIMEOUT_SECONDS
+    request_body_timeout_seconds: float = DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS
+    max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS
 
     def __post_init__(self) -> None:
         if self.bind_host != DEFAULT_BIND_HOST:
@@ -56,6 +61,10 @@ class GuardConfig:
             raise ValueError(
                 f'max_output_budget must remain {DEFAULT_MAX_OUTPUT_BUDGET}.'
             )
+        if self.request_body_timeout_seconds <= 0:
+            raise ValueError('request_body_timeout_seconds must be greater than zero.')
+        if type(self.max_concurrent_requests) is not int or self.max_concurrent_requests <= 0:
+            raise ValueError('max_concurrent_requests must be a positive integer.')
 
 
 class RequestValidationError(Exception):
@@ -72,6 +81,39 @@ class GuardHTTPServer(ThreadingHTTPServer):
     resolver: BackendResolver
     guard_config: GuardConfig
     upstream_connection_factory: Callable[[str, int, float], object]
+    request_slots: threading.BoundedSemaphore
+
+    def process_request(self, request, client_address) -> None:
+        if not self.request_slots.acquire(blocking=False):
+            payload = _error_payload(
+                'server_busy',
+                'The request guard concurrency limit is reached.',
+            )
+            response = (
+                b'HTTP/1.1 503 Service Unavailable\r\n'
+                b'Content-Type: application/json\r\n'
+                + f'Content-Length: {len(payload)}\r\n'.encode('ascii')
+                + b'Connection: close\r\n'
+                + b'X-DGX-Request-Guard: unsloth-studio\r\n\r\n'
+                + payload
+            )
+            try:
+                request.sendall(response)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.request_slots.release()
 
 
 def resolve_upstream(server: GuardHTTPServer):
@@ -143,7 +185,18 @@ def read_bounded_body(handler: BaseHTTPRequestHandler, config: GuardConfig) -> b
         )
     if content_length == 0:
         return b''
-    body = handler.rfile.read(content_length)
+    previous_timeout = handler.connection.gettimeout()
+    handler.connection.settimeout(config.request_body_timeout_seconds)
+    try:
+        body = handler.rfile.read(content_length)
+    except (socket.timeout, TimeoutError) as exc:
+        raise RequestValidationError(
+            408,
+            'request_body_timeout',
+            'Timed out while reading the request body.',
+        ) from exc
+    finally:
+        handler.connection.settimeout(previous_timeout)
     if len(body) != content_length:
         raise RequestValidationError(
             400,
@@ -335,6 +388,9 @@ def _create_server(
     server.guard_config = guard_config
     server.resolver = resolver or BackendResolver()
     server.upstream_connection_factory = connection_factory or default_connection_factory
+    server.request_slots = threading.BoundedSemaphore(
+        guard_config.max_concurrent_requests
+    )
     return server
 
 
@@ -358,6 +414,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=DEFAULT_UPSTREAM_TIMEOUT_SECONDS,
     )
+    parser.add_argument(
+        '--request-body-timeout-seconds',
+        type=float,
+        default=DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
+        '--max-concurrent-requests',
+        type=int,
+        default=DEFAULT_MAX_CONCURRENT_REQUESTS,
+    )
     return parser.parse_args(argv)
 
 
@@ -366,6 +432,8 @@ def main(argv: list[str] | None = None) -> int:
     config = GuardConfig(
         max_request_body_bytes=args.max_request_body_bytes,
         upstream_timeout_seconds=args.upstream_timeout_seconds,
+        request_body_timeout_seconds=args.request_body_timeout_seconds,
+        max_concurrent_requests=args.max_concurrent_requests,
     )
     server = _create_server(
         config,

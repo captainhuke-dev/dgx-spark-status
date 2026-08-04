@@ -7,6 +7,7 @@ function normalizedPath(value) {
 }
 
 export const UNSLOTH_STUDIO_ROOT = '/home/mctdgx01/apps/unsloth-studio';
+export const UNSLOTH_STUDIO_LLAMA_SERVER = `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server`;
 export const UNSLOTH_STUDIO_CLIENT_PORT = 56827;
 
 function numericPort(value) {
@@ -15,8 +16,11 @@ function numericPort(value) {
 }
 
 export function isUnslothStudioProcess(process = {}) {
-  const command = String(process.command || '');
-  return command.includes(`${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server`);
+  const command = String(process.command || '').trim();
+  const argv0 = command.split(/\s+/, 1)[0] || '';
+  const executable = String(process.executable || argv0).trim();
+  return executable === UNSLOTH_STUDIO_LLAMA_SERVER &&
+    argv0 === UNSLOTH_STUDIO_LLAMA_SERVER;
 }
 
 export function clientPortForLlamaProcess(process = {}) {

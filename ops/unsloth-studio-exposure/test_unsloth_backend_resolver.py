@@ -69,8 +69,8 @@ def studio_owner(pid=10, ppid=1, start_time='100'):
         pid=pid,
         ppid=ppid,
         start_time=start_time,
-        executable=f'{STUDIO_ROOT}/bin/unsloth',
-        command=f'{STUDIO_ROOT}/bin/unsloth studio',
+        executable=STUDIO_INTERPRETER,
+        command=f'{STUDIO_INTERPRETER} {STUDIO_LAUNCHER} studio',
     )
 
 
@@ -246,6 +246,44 @@ class BackendResolverTests(unittest.TestCase):
 
         self.assertEqual('backend_unavailable', raised.exception.code)
         self.assertEqual([], self.inspector.probe_calls)
+
+    def test_rejects_in_root_parent_without_exact_studio_launcher_argv(self):
+        parent_scenarios = (
+            ProcessRecord(
+                pid=10,
+                ppid=1,
+                start_time='100',
+                executable=f'{STUDIO_ROOT}/bin/not-studio',
+                command=f'{STUDIO_ROOT}/bin/not-studio studio',
+            ),
+            ProcessRecord(
+                pid=10,
+                ppid=1,
+                start_time='100',
+                executable=STUDIO_INTERPRETER,
+                command=f'{STUDIO_INTERPRETER} {STUDIO_LAUNCHER} serve',
+            ),
+        )
+
+        for parent in parent_scenarios:
+            with self.subTest(parent=parent):
+                self.inspector = FakeInspector()
+                self.resolver = BackendResolver(
+                    inspector=self.inspector,
+                    time_fn=self.clock.time,
+                )
+                self.inspector.set_processes([parent, studio_backend()])
+                self.inspector.set_listeners([listener()])
+                self.inspector.set_probe_response(
+                    36321,
+                    (200, {'data': [{'id': LIVE_MODEL_ID}]}),
+                )
+
+                with self.assertRaises(BackendUnavailable) as raised:
+                    self.resolver.resolve()
+
+                self.assertEqual('backend_unavailable', raised.exception.code)
+                self.assertEqual([], self.inspector.probe_calls)
 
     def test_rejects_llama_server_outside_studio_tree(self):
         self.inspector.set_processes([

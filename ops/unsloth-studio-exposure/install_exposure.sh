@@ -11,6 +11,7 @@ GUARD_UNIT_NAME="dgx-unsloth-guard.service"
 LAN_PROXY_UNIT_NAME="dgx-unsloth-lan-proxy.service"
 LAN_BIND_ADDRESS="192.168.0.21"
 GUARD_TARGET="127.0.0.1:56828"
+SYSTEMCTL_BIN="${DGX_UNSLOTH_EXPOSURE_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 
 install_runtime_files() {
   install -d -m 0755 "${RUNTIME_ROOT}" "${USER_UNIT_ROOT}" "${STATE_ROOT}"
@@ -28,10 +29,22 @@ install_runtime_files() {
 systemctl_user() {
   export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
-  /usr/bin/systemctl --user "$@"
+  "${SYSTEMCTL_BIN}" --user "$@"
+}
+
+preflight_install() {
+  "${SCRIPT_DIR}/start_exposure.sh" \
+    --preflight-only \
+    --state-file "${STATE_FILE}" \
+    --evidence-dir "${EVIDENCE_DIR}" \
+    --runtime-root "${SCRIPT_DIR}" \
+    --user-unit-root "${USER_UNIT_ROOT}" \
+    --lan-address "${LAN_BIND_ADDRESS}" \
+    --guard-target "${GUARD_TARGET}"
 }
 
 main() {
+  preflight_install
   install_runtime_files
   systemctl_user daemon-reload
   systemctl_user enable "${GUARD_UNIT_NAME}"
