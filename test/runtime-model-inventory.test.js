@@ -225,8 +225,13 @@ test('multiple configured Studio card matches cannot select the first card', () 
     assert.equal(card.backendPort, null);
     assert.equal(card.proxyPort, null);
     assert.equal(card.inventoryOnly, true);
-    assert.equal(card.lifecycleOwner, 'unsloth-studio');
-    assert.equal(card.exposureOwner, 'dgx-unsloth-guard');
+    assert.equal(card.quarantined, true);
+    assert.equal(
+      card.quarantineReason,
+      'verified-unsloth-studio-shared-client-port',
+    );
+    assert.equal(card.lifecycleOwner, null);
+    assert.equal(card.exposureOwner, null);
   }
 });
 

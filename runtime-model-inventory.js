@@ -136,7 +136,14 @@ function quarantinedSharedStudioClientPortCard(configured) {
   return unavailableRuntimeCard(configured, {
     quarantined: true,
     quarantineReason: 'verified-unsloth-studio-shared-client-port',
+    lifecycleOwner: null,
+    exposureOwner: null,
   });
+}
+
+function usesSharedStudioClientPort(model = {}) {
+  return [model.clientPort, model.proxyPort, model.port].some(value =>
+    numericPort(value) === UNSLOTH_STUDIO_CLIENT_PORT);
 }
 
 export function mergeRunningLlamaProcess(models, process, details = {}) {
@@ -155,10 +162,23 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     ))
     .filter(index => index >= 0);
   const studioProcess = isUnslothStudioProcess(process);
+  const selectedStudioIndex = studioProcess && matchingIndexes.length === 1
+    ? matchingIndexes[0]
+    : -1;
+
+  if (studioProcess) {
+    next.llama = next.llama.map((model, modelIndex) =>
+      modelIndex !== selectedStudioIndex && usesSharedStudioClientPort(model)
+        ? quarantinedSharedStudioClientPortCard(model)
+        : model
+    );
+  }
 
   if (studioProcess && matchingIndexes.length > 1) {
     for (const matchingIndex of matchingIndexes) {
-      next.llama[matchingIndex] = unresolvedStudioCard(next.llama[matchingIndex]);
+      if (next.llama[matchingIndex].quarantined !== true) {
+        next.llama[matchingIndex] = unresolvedStudioCard(next.llama[matchingIndex]);
+      }
     }
     return next;
   }
@@ -166,16 +186,6 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
   const index = matchingIndexes[0] ?? -1;
 
   if (index < 0) {
-    if (studioProcess) {
-      // The shared Studio client port is exposure, not lifecycle identity.
-      // Quarantine port-only config cards before adding the live process card.
-      next.llama = next.llama.map(model =>
-        [model.clientPort, model.port].some(value =>
-          numericPort(value) === UNSLOTH_STUDIO_CLIENT_PORT)
-          ? quarantinedSharedStudioClientPortCard(model)
-          : model
-      );
-    }
     next.llama.push(processInventoryItem(process, details));
     return next;
   }
@@ -217,6 +227,8 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
           inventoryOnly: true,
           lifecycleOwner: 'unsloth-studio',
           exposureOwner: 'dgx-unsloth-guard',
+          quarantined: false,
+          quarantineReason: null,
         }
       : {}),
     ...(studioRuntimeResolved
