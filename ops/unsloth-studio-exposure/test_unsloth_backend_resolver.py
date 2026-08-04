@@ -151,6 +151,52 @@ class BackendResolverTests(unittest.TestCase):
         self.assertEqual(36321, resolved.port)
         self.assertEqual(LIVE_MODEL_ID, resolved.model_id)
 
+    def test_selects_resolved_backend_with_python_studio_parent_command(self):
+        resolved_executable = f'{STUDIO_ROOT}/llama.cpp/build/bin/llama-server'
+        studio_parent_command = (
+            f'{STUDIO_ROOT}/unsloth_studio/bin/python '
+            f'{STUDIO_ROOT}/bin/unsloth studio --host 0.0.0.0 --port 9900'
+        )
+        self.inspector.set_processes([
+            ProcessRecord(
+                pid=768071,
+                ppid=1,
+                start_time='768071-start',
+                executable='/usr/bin/python3.12',
+                command=studio_parent_command,
+            ),
+            ProcessRecord(
+                pid=20,
+                ppid=768071,
+                start_time='200',
+                executable=resolved_executable,
+                command=f'{resolved_executable} --host 127.0.0.1 --port 36321',
+            ),
+        ])
+        self.inspector.set_listeners([listener()])
+        self.inspector.set_probe_response(
+            36321,
+            (200, {'data': [{'id': LIVE_MODEL_ID}]}),
+        )
+
+        resolver = BackendResolver(
+            inspector=self.inspector,
+            studio_root=STUDIO_ROOT,
+            time_fn=self.clock.time,
+        )
+        with mock.patch(
+            'unsloth_backend_resolver.os.path.realpath',
+            side_effect=lambda path: (
+                resolved_executable if path == STUDIO_EXECUTABLE else path
+            ),
+        ):
+            resolved = resolver.resolve()
+
+        self.assertEqual(20, resolved.pid)
+        self.assertEqual(resolved_executable, resolved.executable)
+        self.assertEqual(36321, resolved.port)
+        self.assertEqual(LIVE_MODEL_ID, resolved.model_id)
+
     def test_rejects_llama_server_outside_studio_tree(self):
         self.inspector.set_processes([
             ProcessRecord(
