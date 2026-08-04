@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { realpathSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -15,24 +16,54 @@ import {
   configuredLlamaCandidateMatchesProcess,
 } from '../dev-server.js';
 
+const STUDIO_LLAMA_SERVER = `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server`;
+
+function installedStudioExecutable() {
+  try {
+    return realpathSync(STUDIO_LLAMA_SERVER);
+  } catch {
+    return STUDIO_LLAMA_SERVER;
+  }
+}
+
 test('identifies only the exact installed Studio llama-server path as Unsloth Studio', () => {
   assert.equal(
     isUnslothStudioProcess({
-      command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36321`,
+      executable: installedStudioExecutable(),
+      command: '/forged/argv0 --port 36321',
     }),
     true,
   );
   assert.equal(
     isUnslothStudioProcess({
-      command: '/tmp/llama.cpp/llama-server --port 36321',
+      executable: '/tmp/llama.cpp/llama-server',
+      command: `${STUDIO_LLAMA_SERVER} --port 36321`,
     }),
     false,
   );
   assert.equal(
     isUnslothStudioProcess({
-      command: '/home/mctdgx01/apps/unsloth-studio/bin/llama-server --port 36321',
+      executable: '/home/mctdgx01/apps/unsloth-studio/bin/llama-server',
+      command: `${STUDIO_LLAMA_SERVER} --port 36321`,
     }),
     false,
+  );
+});
+
+test('uses an exact installed-path fallback only when Studio realpath is unavailable', () => {
+  assert.equal(
+    isUnslothStudioProcess(
+      {
+        executable: STUDIO_LLAMA_SERVER,
+        command: '/forged/argv0 --port 36321',
+      },
+      {
+        realpath: () => {
+          throw new Error('installed path unavailable');
+        },
+      },
+    ),
+    true,
   );
 });
 
@@ -46,8 +77,31 @@ test('rejects a non-Studio executable that only mentions the Studio launcher in 
 
   const process = parseRunningLlamaProcessLine(
     `716620 716100 Tue Aug  4 09:14:12 2026 ${spoofedCommand}`,
+    { readExecutable: () => '/opt/llama.cpp/llama-server' },
   );
   assert.equal(process.executable, '/opt/llama.cpp/llama-server');
+  assert.equal(process.isUnslothStudio, false);
+  assert.equal(process.clientPort, 36321);
+});
+
+test('forged argv0 cannot classify a non-Studio proc executable as Studio', () => {
+  const process = parseRunningLlamaProcessLine(
+    `716621 716100 Tue Aug  4 09:14:12 2026 ${STUDIO_LLAMA_SERVER} --port 36321`,
+    { readExecutable: () => '/usr/bin/sleep' },
+  );
+
+  assert.equal(process.executable, '/usr/bin/sleep');
+  assert.equal(process.isUnslothStudio, false);
+  assert.equal(process.clientPort, 36321);
+});
+
+test('unavailable proc executable identity fails closed', () => {
+  const process = parseRunningLlamaProcessLine(
+    `716622 716100 Tue Aug  4 09:14:12 2026 ${STUDIO_LLAMA_SERVER} --port 36321`,
+    { readExecutable: () => null },
+  );
+
+  assert.equal(process.executable, null);
   assert.equal(process.isUnslothStudio, false);
   assert.equal(process.clientPort, 36321);
 });
@@ -55,7 +109,8 @@ test('rejects a non-Studio executable that only mentions the Studio launcher in 
 test('maps Studio processes to the fixed client port while leaving other llama processes unchanged', () => {
   assert.equal(
     clientPortForLlamaProcess({
-      command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36321`,
+      executable: installedStudioExecutable(),
+      command: `${STUDIO_LLAMA_SERVER} --port 36321`,
       port: 36321,
     }),
     UNSLOTH_STUDIO_CLIENT_PORT,
@@ -72,6 +127,7 @@ test('maps Studio processes to the fixed client port while leaving other llama p
 test('parses ps output rows with process identity, backend port, and Studio client port metadata', () => {
   const process = parseRunningLlamaProcessLine(
     `716619 716100 Tue Aug  4 09:14:12 2026 ${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36321 --model /models/deepseek/model.gguf --alias unsloth/DeepSeek-V4-Flash-0731-GGUF --ctx-size 278528`,
+    { readExecutable: () => installedStudioExecutable() },
   );
 
   assert.equal(process.pid, 716619);
@@ -132,6 +188,7 @@ test('matches the configured Studio card by process identity before the shared c
     },
   ];
   const betaProcess = {
+    executable: installedStudioExecutable(),
     command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36322`,
     clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
     port: 36322,
@@ -163,6 +220,7 @@ test('does not choose a Studio card solely from a shared client port when identi
     },
   ];
   const unknownProcess = {
+    executable: installedStudioExecutable(),
     command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36323`,
     clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
     port: 36323,
@@ -186,6 +244,7 @@ test('does not accept a reused PID when the configured Studio start time differs
     env: { MODEL_PATH: '/models/studio-alpha' },
   };
   const reusedProcess = {
+    executable: installedStudioExecutable(),
     command: `${UNSLOTH_STUDIO_ROOT}/llama.cpp/llama-server --port 36324`,
     clientPort: UNSLOTH_STUDIO_CLIENT_PORT,
     port: 36324,

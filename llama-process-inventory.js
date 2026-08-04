@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+
 import {
   clientPortForLlamaProcess,
   isUnslothStudioProcess,
@@ -14,12 +16,30 @@ export function parseCommandArg(command, flags) {
   return match ? match[1] : null;
 }
 
-export function parseRunningLlamaProcessLine(line = '') {
+export function readProcessExecutable(pid, { realpath = realpathSync } = {}) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    return realpath(`/proc/${pid}/exe`);
+  } catch {
+    return null;
+  }
+}
+
+export function parseRunningLlamaProcessLine(
+  line = '',
+  { readExecutable = readProcessExecutable } = {},
+) {
   const match = String(line).match(/^\s*(\d+)\s+(\d+)\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/);
   if (!match) return null;
 
   const [, pidText, ppidText, startedAt, command] = match;
-  const executable = command.trim().split(/\s+/, 1)[0] || '';
+  const pid = Number(pidText);
+  let executable = null;
+  try {
+    executable = readExecutable(pid) || null;
+  } catch {
+    executable = null;
+  }
   const port = numericPort(parseCommandArg(command, ['--port', '-p']));
   const modelPath = parseCommandArg(command, ['--model', '-m']);
   const alias = parseCommandArg(command, ['--alias']);
@@ -29,7 +49,7 @@ export function parseRunningLlamaProcessLine(line = '') {
   const clientPort = clientPortForLlamaProcess(processIdentity);
 
   return {
-    pid: Number(pidText),
+    pid,
     ppid: Number(ppidText),
     startedAt,
     executable,

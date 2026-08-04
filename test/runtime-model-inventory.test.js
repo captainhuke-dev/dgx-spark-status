@@ -1,10 +1,20 @@
 import assert from 'node:assert/strict';
+import { realpathSync } from 'node:fs';
 import test from 'node:test';
 
 import {
   UNSLOTH_STUDIO_CLIENT_PORT,
+  UNSLOTH_STUDIO_LLAMA_SERVER,
   mergeRunningLlamaProcess,
 } from '../runtime-model-inventory.js';
+
+function installedStudioExecutable() {
+  try {
+    return realpathSync(UNSLOTH_STUDIO_LLAMA_SERVER);
+  } catch {
+    return UNSLOTH_STUDIO_LLAMA_SERVER;
+  }
+}
 
 test('merges a raw llama backend into its configured guard preset by alias and keeps the guard port', () => {
   const models = {
@@ -60,6 +70,7 @@ test('prefers a live probed apiModel over stale configured metadata while keepin
     modelPath: '/home/mctdgx01/models/unsloth-DeepSeek-V4-Flash-0731-GGUF-IQ3-XXS/UD-IQ3_XXS/DeepSeek-V4-Flash-0731-UD-IQ3_XXS-00001-of-00004.gguf',
     context: 278528,
     label: 'DeepSeek V4 Flash 0731 Unsloth UD-IQ3_XXS',
+    executable: installedStudioExecutable(),
     command: '/home/mctdgx01/apps/unsloth-studio/llama.cpp/llama-server --port 36321'
   }, { status: 'running', apiModel: 'unsloth/DeepSeek-V4-Flash-0731-GGUF' });
 
@@ -105,6 +116,7 @@ test('creates a Studio inventory item with separate backend and client ports plu
     modelPath: '/models/deepseek/model.gguf',
     context: 278528,
     label: 'DeepSeek V4 Flash 0731',
+    executable: installedStudioExecutable(),
     command: '/home/mctdgx01/apps/unsloth-studio/llama.cpp/llama-server --port 36321'
   }, { status: 'running', apiModel: 'unsloth/DeepSeek-V4-Flash-0731-GGUF' });
 

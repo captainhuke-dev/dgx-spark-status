@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+
 function normalized(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -15,12 +17,17 @@ function numericPort(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-export function isUnslothStudioProcess(process = {}) {
-  const command = String(process.command || '').trim();
-  const argv0 = command.split(/\s+/, 1)[0] || '';
-  const executable = String(process.executable || argv0).trim();
-  return executable === UNSLOTH_STUDIO_LLAMA_SERVER &&
-    argv0 === UNSLOTH_STUDIO_LLAMA_SERVER;
+function installedStudioExecutable(realpath) {
+  try {
+    return realpath(UNSLOTH_STUDIO_LLAMA_SERVER);
+  } catch {
+    return UNSLOTH_STUDIO_LLAMA_SERVER;
+  }
+}
+
+export function isUnslothStudioProcess(process = {}, { realpath = realpathSync } = {}) {
+  const executable = String(process.executable || '').trim();
+  return executable !== '' && executable === installedStudioExecutable(realpath);
 }
 
 export function clientPortForLlamaProcess(process = {}) {
