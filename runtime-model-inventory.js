@@ -105,12 +105,11 @@ function processInventoryItem(process, { status, sizeGB, apiModel, studioRuntime
   };
 }
 
-function unresolvedStudioCard(configured) {
+function unavailableRuntimeCard(configured, metadata = {}) {
   return {
     ...configured,
     inventoryOnly: true,
-    lifecycleOwner: 'unsloth-studio',
-    exposureOwner: 'dgx-unsloth-guard',
+    ...metadata,
     apiModel: null,
     servedModelName: null,
     status: 'loading',
@@ -124,6 +123,20 @@ function unresolvedStudioCard(configured) {
     server: null,
     connectionLabel: null,
   };
+}
+
+function unresolvedStudioCard(configured) {
+  return unavailableRuntimeCard(configured, {
+    lifecycleOwner: 'unsloth-studio',
+    exposureOwner: 'dgx-unsloth-guard',
+  });
+}
+
+function quarantinedSharedStudioClientPortCard(configured) {
+  return unavailableRuntimeCard(configured, {
+    quarantined: true,
+    quarantineReason: 'verified-unsloth-studio-shared-client-port',
+  });
 }
 
 export function mergeRunningLlamaProcess(models, process, details = {}) {
@@ -153,6 +166,16 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
   const index = matchingIndexes[0] ?? -1;
 
   if (index < 0) {
+    if (studioProcess) {
+      // The shared Studio client port is exposure, not lifecycle identity.
+      // Quarantine port-only config cards before adding the live process card.
+      next.llama = next.llama.map(model =>
+        [model.clientPort, model.port].some(value =>
+          numericPort(value) === UNSLOTH_STUDIO_CLIENT_PORT)
+          ? quarantinedSharedStudioClientPortCard(model)
+          : model
+      );
+    }
     next.llama.push(processInventoryItem(process, details));
     return next;
   }
