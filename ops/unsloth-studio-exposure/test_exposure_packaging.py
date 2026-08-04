@@ -1,4 +1,5 @@
 import copy
+import configparser
 import importlib
 import pathlib
 import subprocess
@@ -40,7 +41,7 @@ ExecStart=/usr/bin/python3 /home/mctdgx01/.local/lib/dgx-unsloth-exposure/unslot
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes
-PrivateTmp=yes
+PrivateTmp=no
 
 [Install]
 WantedBy=default.target
@@ -78,6 +79,17 @@ class RecordingRunner:
 
 
 class PackagingSurfaceTests(unittest.TestCase):
+    def test_units_keep_host_inspection_compatible_hardening(self):
+        guard_unit = configparser.ConfigParser(interpolation=None)
+        guard_unit.read(GUARD_UNIT_PATH)
+        lan_unit = configparser.ConfigParser(interpolation=None)
+        lan_unit.read(LAN_UNIT_PATH)
+
+        self.assertFalse(guard_unit.getboolean('Service', 'PrivateTmp', fallback=False))
+        self.assertTrue(guard_unit.getboolean('Service', 'NoNewPrivileges'))
+        self.assertTrue(lan_unit.getboolean('Service', 'PrivateTmp'))
+        self.assertTrue(lan_unit.getboolean('Service', 'NoNewPrivileges'))
+
     def test_required_unit_files_exist_with_exact_contents(self):
         self.assertEqual(EXPECTED_GUARD_UNIT, GUARD_UNIT_PATH.read_text())
         self.assertEqual(EXPECTED_LAN_UNIT, LAN_UNIT_PATH.read_text())

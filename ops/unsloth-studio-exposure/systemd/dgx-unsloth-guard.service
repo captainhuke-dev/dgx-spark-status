@@ -8,7 +8,7 @@ ExecStart=/usr/bin/python3 /home/mctdgx01/.local/lib/dgx-unsloth-exposure/unslot
 Restart=on-failure
 RestartSec=2
 NoNewPrivileges=yes
-PrivateTmp=yes
+PrivateTmp=no
 
 [Install]
 WantedBy=default.target
