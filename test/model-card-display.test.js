@@ -47,6 +47,8 @@ test('SystemMetrics renders full model ID rows with copy buttons for llama, vLLM
   assert.equal((dashboardUi.match(/class="model-id-copy"/g) || []).length, 3);
   assert.equal((dashboardUi.match(/onclick=\{\(\) => copyModelId\(liveModelId\)\}/g) || []).length, 3);
   assert.match(dashboardUi, /await navigator\.clipboard\.writeText\(modelId\);/);
+  assert.match(dashboardUi, /catch \(_clipboardError\)/);
+  assert.match(dashboardUi, /if \(!copied && typeof document !== 'undefined' && document\.body\)/);
   assert.match(dashboardUi, /const textarea = document\.createElement\('textarea'\);/);
   assert.match(dashboardUi, /textarea\.readOnly = true;/);
   assert.match(dashboardUi, /textarea\.value = modelId;/);

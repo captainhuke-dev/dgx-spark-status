@@ -195,9 +195,15 @@
     let copied = false;
     try {
       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(modelId);
-        copied = true;
-      } else if (typeof document !== 'undefined' && document.body) {
+        try {
+          await navigator.clipboard.writeText(modelId);
+          copied = true;
+        } catch (_clipboardError) {
+          copied = false;
+        }
+      }
+
+      if (!copied && typeof document !== 'undefined' && document.body) {
         const textarea = document.createElement('textarea');
         textarea.value = modelId;
         textarea.readOnly = true;
