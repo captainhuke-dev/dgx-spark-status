@@ -254,8 +254,12 @@ def _load_serve_document(evidence_dir: Path) -> Any:
         ['tailscale', 'serve', 'get-config', '--all'],
         check=False,
     )
+    if _extract_tcp_entries(status_document):
+        return status_document
     if config_result.returncode == 0 and config_result.stdout.strip():
-        return json.loads(config_result.stdout)
+        config_document = json.loads(config_result.stdout)
+        if _extract_tcp_entries(config_document):
+            return config_document
     return status_document
 
 

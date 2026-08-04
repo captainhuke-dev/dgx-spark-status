@@ -296,6 +296,58 @@ class TailscaleRouteStateTests(unittest.TestCase):
             calls,
         )
 
+    def test_status_routes_are_authoritative_when_get_config_is_version_only(self):
+        route_state = load_route_state_module()
+        status_document = {
+            'TCP': {
+                '56827': {'TCPForward': GUARD_TARGET},
+                '8443': {'TCPForward': '127.0.0.1:9443'},
+            },
+        }
+        calls = []
+        original_capture = route_state._capture_command_output
+
+        def fake_capture(evidence_dir, name, argv, *, check=False):
+            calls.append(name)
+            if name == 'tailscale-serve-status.json':
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout='{"TCP": {"56827": {"TCPForward": "127.0.0.1:56828"}, "8443": {"TCPForward": "127.0.0.1:9443"}}}',
+                    stderr='',
+                )
+            if name == 'tailscale-serve-get-config-all.json':
+                return subprocess.CompletedProcess(argv, 0, stdout='{"version":"0.0.1"}', stderr='')
+            return subprocess.CompletedProcess(argv, 0, stdout='{}', stderr='')
+
+        route_state._capture_command_output = fake_capture
+        try:
+            document = route_state._load_serve_document(pathlib.Path('/tmp/dgx-unsloth-exposure-tests'))
+        finally:
+            route_state._capture_command_output = original_capture
+
+        self.assertEqual(status_document, document)
+        classification = route_state.classify_tcp_route(
+            document,
+            port=PUBLIC_PORT,
+            expected_target=GUARD_TARGET,
+        )
+        self.assertEqual('matching', classification.status)
+
+        runner = RecordingRunner()
+        plan = route_state.ensure_tcp_route(
+            document,
+            runner=runner,
+            port=PUBLIC_PORT,
+            expected_target=GUARD_TARGET,
+        )
+        self.assertEqual('matching', plan.status)
+        self.assertEqual([], runner.calls)
+        self.assertEqual(
+            ['tailscale-serve-status.json', 'tailscale-serve-get-config-all.json'],
+            calls,
+        )
+
 
 if __name__ == '__main__':
     unittest.main()
