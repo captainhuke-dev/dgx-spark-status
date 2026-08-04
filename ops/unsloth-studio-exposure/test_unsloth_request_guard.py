@@ -127,6 +127,27 @@ class TimeoutBodyStream:
         raise socket.timeout('request body timed out')
 
 
+class TrickledBodyStream:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def read(self, size=-1):
+        return self.read1(size)
+
+    def read1(self, size=-1):
+        if not self.chunks:
+            return b''
+        return self.chunks.pop(0)
+
+
+class TimeoutWriteStream:
+    def write(self, data):
+        raise socket.timeout('downstream client stopped reading')
+
+    def flush(self):
+        return None
+
+
 class RecordingHandlerSocket:
     def __init__(self):
         self.timeout = None
@@ -162,6 +183,7 @@ class HandlerHarnessMixin:
         headers=None,
         body=b'',
         body_stream=None,
+        output_stream=None,
         handler_socket=None,
         resolver=None,
         connection_factory=None,
@@ -193,7 +215,7 @@ class HandlerHarnessMixin:
                 for key, value in (headers or {}).items():
                     self.headers[key] = value
                 self.rfile = body_stream or io.BytesIO(body)
-                self.wfile = io.BytesIO()
+                self.wfile = output_stream or io.BytesIO()
                 self.connection = handler_socket or RecordingHandlerSocket()
                 self.server = types.SimpleNamespace(
                     guard_config=config,
@@ -601,7 +623,35 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
 
         self.assertEqual(408, handler.response_code)
         self.assertEqual('request_body_timeout', self.error_payload(handler)['error']['code'])
-        self.assertEqual([0.25, None], handler_socket.set_timeout_calls)
+        self.assertEqual(2, len(handler_socket.set_timeout_calls))
+        self.assertGreater(handler_socket.set_timeout_calls[0], 0)
+        self.assertLessEqual(handler_socket.set_timeout_calls[0], 0.25)
+        self.assertIsNone(handler_socket.set_timeout_calls[-1])
+        self.assertEqual(0, resolver.resolve_calls)
+        self.assertIsNone(connection.request_call)
+
+    def test_trickled_body_cannot_extend_absolute_read_deadline(self):
+        guard = load_guard_module()
+        handler_socket = RecordingHandlerSocket()
+        config = guard.GuardConfig(request_body_timeout_seconds=1.0)
+        handler, resolver, _, connection = self.build_handler(
+            guard,
+            method='POST',
+            path='/v1/chat/completions',
+            headers={'Content-Length': '3'},
+            body_stream=TrickledBodyStream([b'{', b'}', b'\n']),
+            handler_socket=handler_socket,
+            config=config,
+        )
+
+        with mock.patch(
+            'time.monotonic',
+            side_effect=[0.0, 0.0, 0.6, 0.6, 1.1],
+        ):
+            handler.do_POST()
+
+        self.assertEqual(408, handler.response_code)
+        self.assertEqual('request_body_timeout', self.error_payload(handler)['error']['code'])
         self.assertEqual(0, resolver.resolve_calls)
         self.assertIsNone(connection.request_call)
 
@@ -617,10 +667,53 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
 
         handler.do_POST()
 
-        self.assertEqual(400, handler.response_code)
+        self.assertEqual(408, handler.response_code)
         self.assertEqual('incomplete_body', self.error_payload(handler)['error']['code'])
         self.assertEqual(0, resolver.resolve_calls)
         self.assertIsNone(connection.request_call)
+
+    def test_partial_headers_time_out_and_release_the_bounded_slot(self):
+        guard = load_guard_module()
+        connection = FakeUpstreamConnection(
+            response=FakeUpstreamResponse(body=b'{"data":[]}')
+        )
+        server = guard._create_server(
+            guard.GuardConfig(
+                request_body_timeout_seconds=0.1,
+                max_concurrent_requests=1,
+            ),
+            resolver=FakeResolver(),
+            server_address=('127.0.0.1', 0),
+            bind_and_activate=True,
+            connection_factory=RecordingConnectionFactory(connection),
+        )
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        idle_client = None
+        next_client = None
+        try:
+            address = server.socket.getsockname()
+            idle_client = socket.create_connection(address, timeout=1)
+            idle_client.sendall(b'GET /v1/models HTTP/1.1\r\nHost:')
+            idle_client.settimeout(0.5)
+
+            self.assertEqual(b'', idle_client.recv(1))
+
+            next_client = socket.create_connection(address, timeout=1)
+            next_client.sendall(
+                b'GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'
+            )
+            response = self.read_socket_response(next_client)
+            self.assertIn(b'HTTP/1.1 200', response)
+            self.assertIn(b'{"data":[]}', response)
+        finally:
+            if idle_client is not None:
+                idle_client.close()
+            if next_client is not None:
+                next_client.close()
+            server.shutdown()
+            server.server_close()
+            server_thread.join(1)
 
     def test_rejects_request_above_concurrency_limit_with_stable_error(self):
         guard = load_guard_module()
@@ -757,6 +850,24 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
         self.assertEqual(1, resolver.invalidate_calls)
         payload = self.error_payload(handler)
         self.assertEqual(payload['error']['code'], 'upstream_timeout')
+
+    def test_downstream_write_timeout_does_not_replace_started_upstream_response(self):
+        guard = load_guard_module()
+        resolver = FakeResolver()
+        handler, resolver, _, _ = self.build_handler(
+            guard,
+            method='GET',
+            path='/v1/models',
+            resolver=resolver,
+            upstream_response=FakeUpstreamResponse(body=b'first chunk'),
+            output_stream=TimeoutWriteStream(),
+        )
+
+        handler.do_GET()
+
+        self.assertEqual(200, handler.response_code)
+        self.assertEqual(0, resolver.invalidate_calls)
+        self.assertTrue(handler.close_connection)
 
     def test_never_replays_post_after_upstream_failure(self):
         guard = load_guard_module()

@@ -5,6 +5,7 @@ import http.client
 import json
 import socket
 import threading
+import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable
@@ -22,6 +23,7 @@ DEFAULT_UPSTREAM_TIMEOUT_SECONDS = 30.0
 DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS = 10.0
 DEFAULT_MAX_CONCURRENT_REQUESTS = 8
 RESPONSE_STREAM_CHUNK_SIZE = 64 * 1024
+REQUEST_BODY_READ_CHUNK_SIZE = 64 * 1024
 ERROR_MESSAGE_LIMIT = 200
 HOP_BY_HOP_HEADERS = {
     'connection',
@@ -75,6 +77,10 @@ class RequestValidationError(Exception):
         self.message = message
 
 
+class DownstreamWriteError(Exception):
+    pass
+
+
 class GuardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -84,6 +90,11 @@ class GuardHTTPServer(ThreadingHTTPServer):
     request_slots: threading.BoundedSemaphore
 
     def process_request(self, request, client_address) -> None:
+        try:
+            request.settimeout(self.guard_config.request_body_timeout_seconds)
+        except OSError:
+            self.shutdown_request(request)
+            return
         if not self.request_slots.acquire(blocking=False):
             payload = _error_payload(
                 'server_busy',
@@ -186,9 +197,35 @@ def read_bounded_body(handler: BaseHTTPRequestHandler, config: GuardConfig) -> b
     if content_length == 0:
         return b''
     previous_timeout = handler.connection.gettimeout()
-    handler.connection.settimeout(config.request_body_timeout_seconds)
+    deadline = time.monotonic() + config.request_body_timeout_seconds
+    chunks: list[bytes] = []
+    bytes_remaining = content_length
+    read_chunk = getattr(handler.rfile, 'read1', None) or handler.rfile.read
     try:
-        body = handler.rfile.read(content_length)
+        while bytes_remaining > 0:
+            time_remaining = deadline - time.monotonic()
+            if time_remaining <= 0:
+                raise RequestValidationError(
+                    408,
+                    'request_body_timeout',
+                    'Timed out while reading the request body.',
+                )
+            handler.connection.settimeout(time_remaining)
+            chunk = read_chunk(min(bytes_remaining, REQUEST_BODY_READ_CHUNK_SIZE))
+            if not chunk:
+                raise RequestValidationError(
+                    408,
+                    'incomplete_body',
+                    'Request body ended before Content-Length bytes were read.',
+                )
+            chunks.append(chunk)
+            bytes_remaining -= len(chunk)
+            if time.monotonic() > deadline:
+                raise RequestValidationError(
+                    408,
+                    'request_body_timeout',
+                    'Timed out while reading the request body.',
+                )
     except (socket.timeout, TimeoutError) as exc:
         raise RequestValidationError(
             408,
@@ -197,13 +234,7 @@ def read_bounded_body(handler: BaseHTTPRequestHandler, config: GuardConfig) -> b
         ) from exc
     finally:
         handler.connection.settimeout(previous_timeout)
-    if len(body) != content_length:
-        raise RequestValidationError(
-            400,
-            'incomplete_body',
-            'Request body ended before Content-Length bytes were read.',
-        )
-    return body
+    return b''.join(chunks)
 
 
 def validate_json_budget(body: bytes, config: GuardConfig) -> None:
@@ -283,6 +314,7 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
     def _handle_proxy_request(self) -> None:
         resolved_backend = None
         upstream = None
+        self._proxy_response_started = False
         try:
             self._enforce_request_policy()
             body = read_bounded_body(self, self.server.guard_config)
@@ -302,6 +334,8 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
             )
             response = upstream.getresponse()
             self._write_upstream_response(response)
+        except DownstreamWriteError:
+            self.close_connection = True
         except RequestValidationError as exc:
             self._send_json_error(exc.status_code, exc.code, exc.message)
         except BackendUnavailable:
@@ -319,11 +353,17 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
         except (socket.timeout, TimeoutError):
             if resolved_backend is not None:
                 self.server.resolver.invalidate()
-            self._send_json_error(504, 'upstream_timeout', 'Upstream request timed out.')
+            if self._proxy_response_started:
+                self.close_connection = True
+            else:
+                self._send_json_error(504, 'upstream_timeout', 'Upstream request timed out.')
         except OSError as exc:
             if resolved_backend is not None:
                 self.server.resolver.invalidate()
-            self._send_json_error(502, 'bad_gateway', f'Upstream request failed: {exc}.')
+            if self._proxy_response_started:
+                self.close_connection = True
+            else:
+                self._send_json_error(502, 'bad_gateway', f'Upstream request failed: {exc}.')
         finally:
             if upstream is not None:
                 upstream.close()
@@ -337,12 +377,16 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
             )
 
     def _write_upstream_response(self, response) -> None:
+        self._proxy_response_started = True
         self.send_response(response.status, getattr(response, 'reason', None))
         for key, value in filter_response_headers(response.getheaders()):
             self.send_header(key, value)
         self.send_header('Connection', 'close')
         self.send_header('X-DGX-Request-Guard', 'unsloth-studio')
-        self.end_headers()
+        try:
+            self.end_headers()
+        except (OSError, TimeoutError) as exc:
+            raise DownstreamWriteError from exc
         if self.command == 'HEAD':
             self.close_connection = True
             return
@@ -351,8 +395,11 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
             chunk = read_chunk(RESPONSE_STREAM_CHUNK_SIZE)
             if not chunk:
                 break
-            self.wfile.write(chunk)
-            self.wfile.flush()
+            try:
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            except (OSError, TimeoutError) as exc:
+                raise DownstreamWriteError from exc
         self.close_connection = True
 
     def _send_json_error(self, status_code: int, code: str, message: str) -> None:
