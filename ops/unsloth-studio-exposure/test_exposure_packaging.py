@@ -189,6 +189,7 @@ fi
         *,
         route_conflict=False,
         listener_conflict=False,
+        listener_pid_unavailable=False,
         runs=1,
     ):
         with tempfile.TemporaryDirectory() as temp_root_text:
@@ -238,6 +239,11 @@ exit 0
                 fake_ss.write_text(
                     '#!/usr/bin/env bash\n'
                     "printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:((\"evil\",pid=999,fd=3))\\n'\n"
+                )
+            elif listener_pid_unavailable:
+                fake_ss.write_text(
+                    '#!/usr/bin/env bash\n'
+                    "printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:*\\n'\n"
                 )
             else:
                 fake_ss.write_text(f'''#!/usr/bin/env bash
@@ -413,6 +419,17 @@ fi
         )
 
         self.assertNotEqual(0, results[0].returncode)
+        self.assertFalse(runtime_exists)
+        self.assertFalse(units_exist)
+        self.assertTrue(all(' show ' in f' {call} ' for call in calls))
+
+    def test_install_listener_without_pid_metadata_is_occupied_before_mutation(self):
+        results, runtime_exists, units_exist, calls = self.run_install_with_fake_preflight(
+            listener_pid_unavailable=True,
+        )
+
+        self.assertNotEqual(0, results[0].returncode)
+        self.assertIn('occupied unowned listener', results[0].stderr)
         self.assertFalse(runtime_exists)
         self.assertFalse(units_exist)
         self.assertTrue(all(' show ' in f' {call} ' for call in calls))

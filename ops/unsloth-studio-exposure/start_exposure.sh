@@ -108,7 +108,11 @@ for line in result.stdout.splitlines():
         f'*:{port}',
     }
     if local in {f'{host}:{port}', f'[{host}]:{port}'} | wildcard_locals:
-        matches.extend(re.findall(r'pid=(\d+)', line))
+        pids = re.findall(r'pid=(\d+)', line)
+        if pids:
+            matches.extend(pids)
+        else:
+            matches.append('PID_METADATA_UNAVAILABLE')
 print('\n'.join(matches))
 PY
 }
