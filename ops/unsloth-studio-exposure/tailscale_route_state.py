@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import shlex
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -215,7 +217,27 @@ def _write_state(state_file: Path, **entries: str) -> None:
     for key, value in entries.items():
         existing[key] = shlex.quote(value)
     ordered = ''.join(f'{key}={existing[key]}\n' for key in sorted(existing))
-    state_file.write_text(ordered)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=state_file.parent,
+        prefix=f'.{state_file.name}.',
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, 'w') as temporary_file:
+            temporary_file.write(ordered)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, state_file)
+        directory_flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+        directory_descriptor = os.open(state_file.parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
 
 
 def _read_state(state_file: Path) -> dict[str, str]:
@@ -228,6 +250,45 @@ def _read_state(state_file: Path) -> dict[str, str]:
         key, value = raw_line.split('=', 1)
         data[key] = shlex.split(value)[0] if value else ''
     return data
+
+
+def _state_claims_route_ownership(state: dict[str, str]) -> bool:
+    targets_expected_route = (
+        state.get('ROUTE_PORT') == str(ROUTE_PORT)
+        and _strip_target_scheme(state.get('ROUTE_TARGET', ''))
+        == _strip_target_scheme(EXPECTED_TARGET)
+    )
+    if not targets_expected_route or state.get('ROUTE_REMOVED', '0') == '1':
+        return False
+    if state.get('ROUTE_CREATED') == '1':
+        return True
+    return (
+        state.get('ROUTE_PENDING') == '1'
+        and state.get('ROUTE_PREEXISTING') == '0'
+    )
+
+
+def _record_route_state(
+    state_file: Path,
+    *,
+    created: bool,
+    preexisting: bool,
+    pending: bool,
+    removed: bool = False,
+) -> None:
+    _write_state(
+        state_file,
+        ROUTE_CREATED='1' if created else '0',
+        ROUTE_PREEXISTING='1' if preexisting else '0',
+        ROUTE_PENDING='1' if pending else '0',
+        ROUTE_PORT=str(ROUTE_PORT),
+        ROUTE_TARGET=EXPECTED_TARGET,
+        ROUTE_REMOVED='1' if removed else '0',
+    )
+
+
+def _compensate_created_route(runner) -> None:
+    runner.run(['tailscale', 'serve', '--bg', f'--tcp={ROUTE_PORT}', 'off'])
 
 
 def _capture_command_output(evidence_dir: Path, name: str, argv: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -307,58 +368,64 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == 'ensure':
-        classification = ensure_tcp_route(serve_document, runner=runner)
+        classification = classify_tcp_route(serve_document)
+        if classification.status == 'conflicting':
+            raise RouteConflict(
+                f'Existing TCP {ROUTE_PORT} route points to {classification.existing_target}, not {EXPECTED_TARGET}.'
+            )
         state = _read_state(state_file)
-        route_was_owned = (
-            state.get('ROUTE_CREATED') == '1'
-            and state.get('ROUTE_REMOVED', '0') != '1'
-            and state.get('ROUTE_PORT') == str(ROUTE_PORT)
-            and _strip_target_scheme(state.get('ROUTE_TARGET', ''))
-            == _strip_target_scheme(EXPECTED_TARGET)
+        route_was_owned = _state_claims_route_ownership(state)
+        if classification.status == 'matching':
+            _record_route_state(
+                state_file,
+                created=route_was_owned,
+                preexisting=not route_was_owned,
+                pending=False,
+            )
+            return 0
+
+        _record_route_state(
+            state_file,
+            created=False,
+            preexisting=False,
+            pending=True,
         )
-        if classification.status == 'absent':
-            _write_state(
+        try:
+            ensure_tcp_route(serve_document, runner=runner)
+            verified_document = _capture_evidence(evidence_dir)
+            verified = classify_tcp_route(verified_document)
+            if verified.status != 'matching':
+                raise RouteConflict(
+                    f'Added TCP {ROUTE_PORT} route was not verified at exact target {EXPECTED_TARGET}.'
+                )
+            _record_route_state(
                 state_file,
-                ROUTE_CREATED='1',
-                ROUTE_PREEXISTING='0',
-                ROUTE_PORT=str(ROUTE_PORT),
-                ROUTE_TARGET=EXPECTED_TARGET,
-                ROUTE_REMOVED='0',
+                created=True,
+                preexisting=False,
+                pending=False,
             )
-        elif route_was_owned:
-            _write_state(
-                state_file,
-                ROUTE_CREATED='1',
-                ROUTE_PREEXISTING='0',
-                ROUTE_PORT=str(ROUTE_PORT),
-                ROUTE_TARGET=EXPECTED_TARGET,
-                ROUTE_REMOVED='0',
-            )
-        else:
-            _write_state(
-                state_file,
-                ROUTE_CREATED='0',
-                ROUTE_PREEXISTING='1',
-                ROUTE_PORT=str(ROUTE_PORT),
-                ROUTE_TARGET=EXPECTED_TARGET,
-                ROUTE_REMOVED='0',
-            )
+        except BaseException as exc:
+            try:
+                _compensate_created_route(runner)
+            except BaseException as compensation_error:
+                exc.add_note(f'Exact route compensation also failed: {compensation_error}')
+                raise exc from compensation_error
+            raise
         return 0
 
     state = _read_state(state_file)
-    route_created = state.get('ROUTE_CREATED') == '1'
+    route_created = _state_claims_route_ownership(state)
     classification = remove_owned_tcp_route(
         serve_document,
         runner=runner,
         route_created=route_created,
     )
-    _write_state(
+    _record_route_state(
         state_file,
-        ROUTE_CREATED='1' if route_created else '0',
-        ROUTE_PREEXISTING=state.get('ROUTE_PREEXISTING', '0'),
-        ROUTE_PORT=str(ROUTE_PORT),
-        ROUTE_TARGET=EXPECTED_TARGET,
-        ROUTE_REMOVED='1' if route_created and classification.status == 'matching' else '0',
+        created=route_created,
+        preexisting=state.get('ROUTE_PREEXISTING', '0') == '1',
+        pending=False,
+        removed=route_created and classification.status in {'absent', 'matching'},
     )
     return 0
 

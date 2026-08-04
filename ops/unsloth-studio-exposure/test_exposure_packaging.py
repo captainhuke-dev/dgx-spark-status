@@ -82,6 +82,16 @@ class RecordingRunner:
         return 0
 
 
+class CallbackRunner(RecordingRunner):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def run(self, argv):
+        self.callback(list(argv))
+        return super().run(argv)
+
+
 class PackagingSurfaceTests(unittest.TestCase):
     def run_start_with_fake_host(self, *, units_preexisting):
         with tempfile.TemporaryDirectory() as temp_root_text:
@@ -539,6 +549,125 @@ class TailscaleRouteStateTests(unittest.TestCase):
             runner.calls,
         )
 
+    def test_ensure_records_pending_state_before_add_and_verifies_exact_route(self):
+        route_state = load_route_state_module()
+        absent = self.serve_status()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+
+            def inspect_pending(argv):
+                if argv[-1] == 'off':
+                    return
+                state = route_state._read_state(state_file)
+                self.assertEqual('1', state['ROUTE_PENDING'])
+                self.assertEqual('0', state['ROUTE_CREATED'])
+                self.assertEqual('0', state['ROUTE_PREEXISTING'])
+                self.assertEqual(str(PUBLIC_PORT), state['ROUTE_PORT'])
+                self.assertEqual(GUARD_TARGET, state['ROUTE_TARGET'])
+
+            runner = CallbackRunner(inspect_pending)
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[absent, matching],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                route_state.main([
+                    'ensure', '--state-file', str(state_file),
+                    '--evidence-dir', str(evidence_dir),
+                ])
+
+            self.assertEqual(
+                [['tailscale', 'serve', '--bg', '--tcp=56827', GUARD_TARGET]],
+                runner.calls,
+            )
+            state = route_state._read_state(state_file)
+            self.assertEqual('0', state['ROUTE_PENDING'])
+            self.assertEqual('1', state['ROUTE_CREATED'])
+            self.assertEqual('0', state['ROUTE_PREEXISTING'])
+
+    def test_final_ownership_write_failure_compensates_exact_created_route(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        absent = self.serve_status()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            original_write_state = route_state._write_state
+
+            def fail_final_write(path, **entries):
+                if entries.get('ROUTE_CREATED') == '1' and entries.get('ROUTE_PENDING') == '0':
+                    raise OSError('simulated final state write failure')
+                return original_write_state(path, **entries)
+
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[absent, matching],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+                mock.patch.object(route_state, '_write_state', side_effect=fail_final_write),
+            ):
+                with self.assertRaisesRegex(OSError, 'simulated final state write failure'):
+                    route_state.main([
+                        'ensure', '--state-file', str(state_file),
+                        '--evidence-dir', str(evidence_dir),
+                    ])
+
+            self.assertEqual(
+                [
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', GUARD_TARGET],
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', 'off'],
+                ],
+                runner.calls,
+            )
+            state = route_state._read_state(state_file)
+            self.assertEqual('1', state['ROUTE_PENDING'])
+            self.assertEqual('0', state['ROUTE_CREATED'])
+
+    def test_post_mutation_verification_failure_compensates_exact_created_route(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        absent = self.serve_status()
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            evidence_dir = temp_root / 'evidence'
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[absent, absent],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                with self.assertRaises(route_state.RouteConflict):
+                    route_state.main([
+                        'ensure', '--state-file', str(state_file),
+                        '--evidence-dir', str(evidence_dir),
+                    ])
+
+            self.assertEqual(
+                [
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', GUARD_TARGET],
+                    ['tailscale', 'serve', '--bg', '--tcp=56827', 'off'],
+                ],
+                runner.calls,
+            )
+
     def test_repeated_ensure_preserves_created_route_ownership_for_remove(self):
         route_state = load_route_state_module()
         runner = RecordingRunner()
@@ -554,7 +683,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, matching, matching],
+                    side_effect=[absent, matching, matching, matching],
                 ),
                 mock.patch.object(
                     route_state,
