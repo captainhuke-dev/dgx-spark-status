@@ -17,6 +17,7 @@
 - The model endpoint must expose the exact live model ID on both LAN and Tailscale paths. A successful `/v1/models` check and a bounded completion request are required before claiming the route is ready.
 - Runtime scripts, PID/PGID records, raw command output, and rollback evidence stay outside Git under `/home/mctdgx01/models/operation_records/dashboard-unsloth-20260804T000000Z/`. Canonical sanitized Markdown belongs in the existing `Unsloth-Studio-main-UnslothAI-NA-9900` model folder in the DGXmodelmd repository.
 - Dashboard model inventory is inventory-only for this Studio process: do not add a Dashboard Start/Stop profile for it. Future Unsloth Studio models must follow the same dynamic live-ID and guarded-exposure rule.
+- The Dashboard UI must remain reachable from another LAN device at `http://192.168.0.21:9000/` and from the Tailscale address at `http://100.108.68.20:9000/`. The no-port example `http://192.168.0.21/` means TCP 80 and may only be added through an explicitly owned, privilege-authorized reverse proxy; do not silently take port 80 or claim it is ready when no host listener/authority exists.
 
 ---
 
@@ -76,7 +77,8 @@
 2. Read the first SSE payload from `/api/metrics` and assert the LLAMA inventory contains `unsloth/DeepSeek-V4-Flash-0731-GGUF`, the live backend port `56827`, and a running status.
 3. From loopback, LAN IPv4, Tailscale IPv4, Tailscale IPv6, and MagicDNS where locally resolvable, run `/v1/models` and assert the exact ID. Run a bounded non-streaming chat/completion request with the exact ID and a small output budget through LAN and Tailscale. Test a streaming request through the guard and confirm it receives incremental response bytes and the guard header.
 4. Verify the raw backend is still loopback-only, the public paths terminate at the guard, the guard rejects an over-limit request, unrelated Tailscale routes are unchanged, and other Unsloth vLLM profiles were not touched.
-5. Save raw command output and JSON responses without credentials or model weights in the operation record.
+5. Verify the Dashboard HTML itself from LAN `http://192.168.0.21:9000/` and Tailscale `http://100.108.68.20:9000/`. Probe `http://192.168.0.21/` separately; if TCP 80 has no existing authorized listener, record that bounded limitation rather than changing ownership or using a privileged workaround.
+6. Save raw command output and JSON responses without credentials or model weights in the operation record.
 
 ## Task 7: Record canonical handoff and complete verification
 
