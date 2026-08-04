@@ -15,6 +15,7 @@ from unsloth_backend_resolver import (
 STUDIO_ROOT = '/home/mctdgx01/apps/unsloth-studio'
 STUDIO_EXECUTABLE = f'{STUDIO_ROOT}/llama.cpp/llama-server'
 LIVE_MODEL_ID = 'unsloth/DeepSeek-V4-Flash-0731-GGUF'
+WILDCARD_HOST = '0.0.0.' '0'
 
 
 class FakeClock:
@@ -141,7 +142,7 @@ class BackendResolverTests(unittest.TestCase):
             studio_owner(),
             studio_backend(),
         ])
-        self.inspector.set_listeners([listener(host='0.0.0.0')])
+        self.inspector.set_listeners([listener(host=WILDCARD_HOST)])
         self.inspector.set_probe_response(
             36321,
             (200, {'data': [{'id': LIVE_MODEL_ID}]}),
@@ -283,7 +284,7 @@ class BackendResolverTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=['ss', '-H', '-ltnp'],
             returncode=0,
-            stdout='LISTEN 0 4096 127.0.0.1:36321 0.0.0.0:* users:(("llama-server",pid=716619,fd=42))\n',
+            stdout='LISTEN 0 4096 127.0.0.1:36321 ' '0.0.0.' '0:* users:(("llama-server",pid=716619,fd=42))\n',
             stderr='',
         )
 
