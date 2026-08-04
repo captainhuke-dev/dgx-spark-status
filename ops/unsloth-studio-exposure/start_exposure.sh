@@ -203,6 +203,60 @@ assert_listener_present() {
   assert_single_exact_owned_listener "$1" "$2" "$3" "0"
 }
 
+assert_guard_ready() {
+  python3 - "${GUARD_PORT}" <<'PY'
+import http.client
+import json
+import sys
+
+port = int(sys.argv[1])
+connection = http.client.HTTPConnection('127.0.0.1', port, timeout=3)
+try:
+    connection.request('GET', '/v1/models', headers={'Connection': 'close'})
+    response = connection.getresponse()
+    body = response.read(1024 * 1024 + 1)
+except Exception as error:
+    print(f'guard readiness failed before outward exposure: {error}', file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    connection.close()
+
+if response.status != 200:
+    print(
+        f'guard readiness requires HTTP 200 /v1/models; received {response.status}',
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if response.getheader('X-DGX-Request-Guard') != 'unsloth-studio':
+    print(
+        'guard readiness requires X-DGX-Request-Guard=unsloth-studio',
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if len(body) > 1024 * 1024:
+    print('guard readiness response exceeded 1 MiB', file=sys.stderr)
+    raise SystemExit(1)
+try:
+    payload = json.loads(body)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    print(f'guard readiness returned invalid JSON: {error}', file=sys.stderr)
+    raise SystemExit(1)
+
+data = payload.get('data') if isinstance(payload, dict) else None
+ids = [
+    item.get('id').strip()
+    for item in data
+    if isinstance(item, dict) and isinstance(item.get('id'), str) and item.get('id').strip()
+] if isinstance(data, list) else []
+if not isinstance(data, list) or len(data) != 1 or len(ids) != 1:
+    print(
+        'guard readiness requires exactly one nonempty live model ID',
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
 preflight_exposure() {
   local route_helper="$1"
   python3 "${route_helper}" preflight \
@@ -238,6 +292,7 @@ main() {
     GUARD_STARTED="1"
   fi
   assert_listener_present "127.0.0.1" "${GUARD_PORT}" "${GUARD_UNIT_NAME}"
+  assert_guard_ready
 
   systemctl_user start "${LAN_PROXY_UNIT_NAME}"
   if [[ "${LAN_WAS_ACTIVE}" == "0" ]]; then

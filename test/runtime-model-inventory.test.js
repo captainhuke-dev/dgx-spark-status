@@ -131,6 +131,9 @@ test('creates a Studio inventory item with separate backend and client ports plu
   assert.equal(merged.llama[0].apiModel, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(merged.llama[0].servedModelName, 'unsloth/DeepSeek-V4-Flash-0731-GGUF');
   assert.equal(merged.llama[0].connectionLabel, 'llama-server · :56827 · ctx 272K');
+  assert.equal(merged.llama[0].inventoryOnly, true);
+  assert.equal(merged.llama[0].lifecycleOwner, 'unsloth-studio');
+  assert.equal(merged.llama[0].exposureOwner, 'dgx-unsloth-guard');
 });
 
 test('clears Studio API, running, backend, and client fields when runtime identity is ambiguous', () => {
@@ -221,6 +224,9 @@ test('multiple configured Studio card matches cannot select the first card', () 
     assert.equal(card.clientPort, null);
     assert.equal(card.backendPort, null);
     assert.equal(card.proxyPort, null);
+    assert.equal(card.inventoryOnly, true);
+    assert.equal(card.lifecycleOwner, 'unsloth-studio');
+    assert.equal(card.exposureOwner, 'dgx-unsloth-guard');
   }
 });
 

@@ -70,7 +70,8 @@ export function modelMatchesRunningLlamaProcess(model = {}, process = {}) {
 function processInventoryItem(process, { status, sizeGB, apiModel, studioRuntimeResolved } = {}) {
   const resolvedStatus = status || 'running';
   const resolvedModel = String(apiModel || '').trim() || null;
-  const studioIdentityUnavailable = isUnslothStudioProcess(process) && studioRuntimeResolved === false;
+  const studioProcess = isUnslothStudioProcess(process);
+  const studioIdentityUnavailable = studioProcess && studioRuntimeResolved === false;
   const clientPort = studioIdentityUnavailable ? null : clientPortForLlamaProcess(process);
   const backendPort = studioIdentityUnavailable ? null : backendPortForLlamaProcess(process);
   const displayPort = clientPort || backendPort;
@@ -93,13 +94,23 @@ function processInventoryItem(process, { status, sizeGB, apiModel, studioRuntime
     status: resolvedStatus,
     running: resolvedStatus === 'running',
     runtime: 'llama',
-    source: 'llama-process'
+    source: 'llama-process',
+    ...(studioProcess
+      ? {
+          inventoryOnly: true,
+          lifecycleOwner: 'unsloth-studio',
+          exposureOwner: 'dgx-unsloth-guard',
+        }
+      : {})
   };
 }
 
 function unresolvedStudioCard(configured) {
   return {
     ...configured,
+    inventoryOnly: true,
+    lifecycleOwner: 'unsloth-studio',
+    exposureOwner: 'dgx-unsloth-guard',
     apiModel: null,
     servedModelName: null,
     status: 'loading',
@@ -178,6 +189,13 @@ export function mergeRunningLlamaProcess(models, process, details = {}) {
     connectionLabel: studioProcess
       ? connectionLabelForProcess(process, displayPort)
       : configured.connectionLabel || connectionLabelForProcess(process, displayPort),
+    ...(studioProcess
+      ? {
+          inventoryOnly: true,
+          lifecycleOwner: 'unsloth-studio',
+          exposureOwner: 'dgx-unsloth-guard',
+        }
+      : {}),
     ...(studioRuntimeResolved
       ? (studioProcess ? { proxyPort: clientPort } : {})
       : {

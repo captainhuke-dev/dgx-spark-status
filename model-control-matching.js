@@ -71,6 +71,7 @@ function preferredMatch(profiles, predicate) {
 export function findModelControlProfile(model = {}, runtimeModel = {}, displayPort, profiles = []) {
   const controls = Array.isArray(profiles) ? profiles : [];
   if (!controls.length) return null;
+  if (model.inventoryOnly === true || runtimeModel.inventoryOnly === true) return null;
 
   const port = Number(displayPort || runtimeModel.port || model.port || 0);
   if (Number.isFinite(port) && port > 0) {

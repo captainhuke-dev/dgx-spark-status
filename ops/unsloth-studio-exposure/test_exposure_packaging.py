@@ -1,12 +1,16 @@
 import copy
 import configparser
+import contextlib
+import http.server
 import importlib
+import json
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -92,6 +96,37 @@ class CallbackRunner(RecordingRunner):
         return super().run(argv)
 
 
+@contextlib.contextmanager
+def guard_probe_server(*, status=200, marker='unsloth-studio', payload=None):
+    response_payload = payload if payload is not None else {
+        'data': [{'id': 'unsloth/DeepSeek-V4-Flash-0731-GGUF'}],
+    }
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(response_payload).encode('utf-8')
+            self.send_response(status)
+            if marker is not None:
+                self.send_header('X-DGX-Request-Guard', marker)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 class PackagingSurfaceTests(unittest.TestCase):
     def run_start_with_fake_host(
         self,
@@ -102,8 +137,18 @@ class PackagingSurfaceTests(unittest.TestCase):
         guard_listener_metadata=True,
         extra_guard_listener='',
         guard_main_pid_sequence=None,
+        guard_http_status=200,
+        guard_marker='unsloth-studio',
+        guard_payload=None,
     ):
-        with tempfile.TemporaryDirectory() as temp_root_text:
+        with (
+            tempfile.TemporaryDirectory() as temp_root_text,
+            guard_probe_server(
+                status=guard_http_status,
+                marker=guard_marker,
+                payload=guard_payload,
+            ) as guard_probe_port,
+        ):
             temp_root = pathlib.Path(temp_root_text)
             fake_bin = temp_root / 'bin'
             active_root = temp_root / 'active'
@@ -182,11 +227,15 @@ esac
                 else ''
             )
             guard_listener_line = (
-                f'LISTEN 0 128 {guard_listener_host}:56828 0.0.0.0:*{guard_owner}'
+                f'LISTEN 0 128 {guard_listener_host}:{guard_probe_port} 0.0.0.0:*{guard_owner}'
+            )
+            rendered_extra_guard_listener = extra_guard_listener.replace(
+                ':56828',
+                f':{guard_probe_port}',
             )
             extra_guard_command = (
-                f"  printf '%s\\n' '{extra_guard_listener}'"
-                if extra_guard_listener
+                f"  printf '%s\\n' '{rendered_extra_guard_listener}'"
+                if rendered_extra_guard_listener
                 else '  :'
             )
             fake_ss = fake_bin / 'ss'
@@ -226,7 +275,7 @@ fi
                     '--runtime-root', str(runtime_root),
                     '--user-unit-root', str(unit_root),
                     '--lan-address', LAN_ADDRESS,
-                    '--guard-target', GUARD_TARGET,
+                    '--guard-target', f'127.0.0.1:{guard_probe_port}',
                 ],
                 capture_output=True,
                 text=True,
@@ -275,9 +324,16 @@ fi
         route_conflict=False,
         listener_conflict=False,
         listener_pid_unavailable=False,
+        start_failure=False,
+        preexisting_files=False,
+        preenabled_units=False,
+        return_snapshot=False,
         runs=1,
     ):
-        with tempfile.TemporaryDirectory() as temp_root_text:
+        with (
+            tempfile.TemporaryDirectory() as temp_root_text,
+            guard_probe_server() as guard_probe_port,
+        ):
             temp_root = pathlib.Path(temp_root_text)
             package_root = temp_root / 'package'
             fake_bin = temp_root / 'bin'
@@ -285,10 +341,22 @@ fi
             unit_root = temp_root / 'installed-units'
             state_root = temp_root / 'state'
             active_root = temp_root / 'active'
+            enabled_root = temp_root / 'enabled'
             systemctl_log = temp_root / 'systemctl.log'
             shutil.copytree(RUNTIME_DIR, package_root)
             fake_bin.mkdir()
             active_root.mkdir()
+            enabled_root.mkdir()
+
+            if preexisting_files:
+                runtime_root.mkdir()
+                unit_root.mkdir()
+                (runtime_root / 'README.md').write_text('preexisting runtime README\n')
+                (unit_root / 'dgx-unsloth-guard.service').write_text('preexisting guard unit\n')
+                (unit_root / 'dgx-unsloth-lan-proxy.service').write_text('preexisting LAN unit\n')
+            if preenabled_units:
+                (enabled_root / 'dgx-unsloth-guard.service').touch()
+                (enabled_root / 'dgx-unsloth-lan-proxy.service').touch()
 
             fake_systemctl = fake_bin / 'systemctl'
             fake_systemctl.write_text(f'''#!/usr/bin/env bash
@@ -297,7 +365,14 @@ if [[ "$1" == "--user" ]]; then shift; fi
 command="$1"
 unit="${{@: -1}}"
 case "${{command}}" in
-  is-active) [[ -f "{active_root}/${{unit}}" ]] ;;
+  is-active)
+    [[ -f "{active_root}/${{unit}}" ]]
+    exit $?
+    ;;
+  is-enabled)
+    [[ -f "{enabled_root}/${{unit}}" ]]
+    exit $?
+    ;;
   show)
     if [[ -f "{active_root}/${{unit}}" ]]; then
       [[ "${{unit}}" == "dgx-unsloth-guard.service" ]] && printf '101\\n' || printf '102\\n'
@@ -307,6 +382,8 @@ case "${{command}}" in
     ;;
   start) touch "{active_root}/${{unit}}" ;;
   stop) rm -f "{active_root}/${{unit}}" ;;
+  enable) touch "{enabled_root}/${{unit}}" ;;
+  disable) rm -f "{enabled_root}/${{unit}}" ;;
 esac
 exit 0
 ''')
@@ -323,17 +400,17 @@ exit 0
             if listener_conflict:
                 fake_ss.write_text(
                     '#!/usr/bin/env bash\n'
-                    "printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:((\"evil\",pid=999,fd=3))\\n'\n"
+                    f"printf 'LISTEN 0 128 127.0.0.1:{guard_probe_port} 0.0.0.0:* users:((\"evil\",pid=999,fd=3))\\n'\n"
                 )
             elif listener_pid_unavailable:
                 fake_ss.write_text(
                     '#!/usr/bin/env bash\n'
-                    "printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:*\\n'\n"
+                    f"printf 'LISTEN 0 128 127.0.0.1:{guard_probe_port} 0.0.0.0:*\\n'\n"
                 )
             else:
                 fake_ss.write_text(f'''#!/usr/bin/env bash
 if [[ -f "{active_root}/dgx-unsloth-guard.service" ]]; then
-  printf 'LISTEN 0 128 127.0.0.1:56828 0.0.0.0:* users:(("python3",pid=101,fd=3))\\n'
+  printf 'LISTEN 0 128 127.0.0.1:{guard_probe_port} 0.0.0.0:* users:(("python3",pid=101,fd=3))\\n'
 fi
 if [[ -f "{active_root}/dgx-unsloth-lan-proxy.service" ]]; then
   printf 'LISTEN 0 128 192.168.0.21:56827 0.0.0.0:* users:(("socat",pid=102,fd=3))\\n'
@@ -347,14 +424,22 @@ fi
                 'import sys\n'
                 + (
                     "raise SystemExit(1 if sys.argv[1] == 'preflight' else 0)\n"
-                    if route_conflict else 'raise SystemExit(0)\n'
+                    if route_conflict else (
+                        "raise SystemExit(1 if sys.argv[1] == 'ensure' else 0)\n"
+                        if start_failure else 'raise SystemExit(0)\n'
+                    )
                 )
             )
             route_helper.chmod(0o755)
 
             install_script = package_root / 'install_exposure.sh'
             install_script.write_text(
-                install_script.read_text().replace('/usr/bin/systemctl', str(fake_systemctl))
+                install_script.read_text()
+                .replace('/usr/bin/systemctl', str(fake_systemctl))
+                .replace(
+                    'GUARD_TARGET="127.0.0.1:56828"',
+                    f'GUARD_TARGET="127.0.0.1:{guard_probe_port}"',
+                )
             )
 
             env = os.environ.copy()
@@ -379,6 +464,21 @@ fi
                 systemctl_log.read_text().splitlines()
                 if systemctl_log.exists() else []
             )
+            if return_snapshot:
+                snapshot = {
+                    'runtime_files': {
+                        path.name: path.read_text()
+                        for path in runtime_root.iterdir()
+                        if path.is_file()
+                    } if runtime_root.exists() else {},
+                    'unit_files': {
+                        path.name: path.read_text()
+                        for path in unit_root.iterdir()
+                        if path.is_file()
+                    } if unit_root.exists() else {},
+                    'enabled_units': sorted(path.name for path in enabled_root.iterdir()),
+                }
+                return results, runtime_root.exists(), unit_root.exists(), calls, snapshot
             return results, runtime_root.exists(), unit_root.exists(), calls
 
     def test_units_keep_host_inspection_compatible_hardening(self):
@@ -513,7 +613,7 @@ fi
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn('wildcard listener', result.stderr)
-        self.assertIn('exact listener 127.0.0.1:56828 is required', result.stderr)
+        self.assertIn('exact listener 127.0.0.1:', result.stderr)
         self.assertIn('--user start dgx-unsloth-guard.service', calls)
         self.assertNotIn('--user start dgx-unsloth-lan-proxy.service', calls)
         self.assertIn('--user stop dgx-unsloth-guard.service', calls)
@@ -565,6 +665,42 @@ fi
         self.assertIn('exactly one listener', result.stderr)
         self.assertNotIn('--user start dgx-unsloth-lan-proxy.service', calls)
         self.assertEqual([], active_units)
+
+    def test_guard_readiness_fails_inside_out_before_lan_or_route_and_cleans_only_new_guard(self):
+        cases = (
+            ('HTTP 200', {'guard_http_status': 503}),
+            ('X-DGX-Request-Guard', {'guard_marker': None}),
+            ('exactly one nonempty live model ID', {'guard_payload': {'data': []}}),
+        )
+        for expected_error, overrides in cases:
+            with self.subTest(expected_error=expected_error):
+                result, calls, active_units = self.run_start_with_fake_host(
+                    units_preexisting=False,
+                    **overrides,
+                )
+
+                self.assertNotEqual(0, result.returncode)
+                self.assertIn(expected_error, result.stderr)
+                self.assertIn('--user start dgx-unsloth-guard.service', calls)
+                self.assertNotIn('--user start dgx-unsloth-lan-proxy.service', calls)
+                self.assertIn('--user stop dgx-unsloth-guard.service', calls)
+                self.assertEqual([], active_units)
+
+    def test_guard_readiness_failure_preserves_preexisting_units(self):
+        result, calls, active_units = self.run_start_with_fake_host(
+            units_preexisting=True,
+            guard_payload={'data': []},
+        )
+
+        self.assertNotEqual(0, result.returncode)
+        self.assertIn('exactly one nonempty live model ID', result.stderr)
+        self.assertNotIn('--user start dgx-unsloth-lan-proxy.service', calls)
+        self.assertNotIn('--user stop dgx-unsloth-guard.service', calls)
+        self.assertNotIn('--user stop dgx-unsloth-lan-proxy.service', calls)
+        self.assertEqual(
+            ['dgx-unsloth-guard.service', 'dgx-unsloth-lan-proxy.service'],
+            active_units,
+        )
 
     def test_stop_fails_when_exact_listener_remains_without_pid_metadata(self):
         result = self.run_stop_with_fake_listener(
@@ -628,6 +764,46 @@ fi
         self.assertTrue(units_exist)
         self.assertNotIn('--user stop dgx-unsloth-guard.service', calls)
         self.assertNotIn('--user stop dgx-unsloth-lan-proxy.service', calls)
+
+    def test_failed_install_rolls_back_only_new_files_and_enablement(self):
+        results, _runtime_exists, _units_exist, calls, snapshot = self.run_install_with_fake_preflight(
+            start_failure=True,
+            return_snapshot=True,
+        )
+
+        self.assertNotEqual(0, results[0].returncode)
+        self.assertEqual({}, snapshot['runtime_files'])
+        self.assertEqual({}, snapshot['unit_files'])
+        self.assertEqual([], snapshot['enabled_units'])
+        self.assertIn('--user disable dgx-unsloth-lan-proxy.service', calls)
+        self.assertIn('--user disable dgx-unsloth-guard.service', calls)
+
+    def test_failed_install_restores_preexisting_files_and_never_disables_preenabled_units(self):
+        results, _runtime_exists, _units_exist, calls, snapshot = self.run_install_with_fake_preflight(
+            start_failure=True,
+            preexisting_files=True,
+            preenabled_units=True,
+            return_snapshot=True,
+        )
+
+        self.assertNotEqual(0, results[0].returncode)
+        self.assertEqual(
+            {'README.md': 'preexisting runtime README\n'},
+            snapshot['runtime_files'],
+        )
+        self.assertEqual(
+            {
+                'dgx-unsloth-guard.service': 'preexisting guard unit\n',
+                'dgx-unsloth-lan-proxy.service': 'preexisting LAN unit\n',
+            },
+            snapshot['unit_files'],
+        )
+        self.assertEqual(
+            ['dgx-unsloth-guard.service', 'dgx-unsloth-lan-proxy.service'],
+            snapshot['enabled_units'],
+        )
+        self.assertNotIn('--user disable dgx-unsloth-guard.service', calls)
+        self.assertNotIn('--user disable dgx-unsloth-lan-proxy.service', calls)
 
 
 class TailscaleRouteStateTests(unittest.TestCase):
@@ -693,6 +869,80 @@ class TailscaleRouteStateTests(unittest.TestCase):
             route_state.normalize_serve_json(removed),
         )
 
+    def test_complete_route_map_comparison_rejects_lost_unrelated_routes(self):
+        route_state = load_route_state_module()
+        before = self.serve_status()
+        after = self.serve_status()
+        after['TCP'].pop('8443')
+        after['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with self.assertRaisesRegex(route_state.RouteConflict, 'unrelated Serve routes changed'):
+            route_state.assert_unrelated_routes_unchanged(before, after)
+
+    def test_package_route_operation_holds_exclusive_lock(self):
+        route_state = load_route_state_module()
+        events = []
+
+        @contextlib.contextmanager
+        def recording_lock(lock_path):
+            events.append(('locked', pathlib.Path(lock_path).name))
+            try:
+                yield
+            finally:
+                events.append(('unlocked', pathlib.Path(lock_path).name))
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            with (
+                mock.patch.object(route_state, '_exclusive_route_lock', recording_lock),
+                mock.patch.object(route_state, '_capture_evidence', return_value=self.serve_status()),
+            ):
+                route_state.main([
+                    'preflight',
+                    '--state-file', str(temp_root / 'active-operation.env'),
+                    '--evidence-dir', str(temp_root / 'evidence'),
+                ])
+
+        self.assertEqual(
+            [('locked', 'active-operation.lock'), ('unlocked', 'active-operation.lock')],
+            events,
+        )
+
+    def test_pre_and_post_serve_evidence_use_distinct_immutable_files(self):
+        route_state = load_route_state_module()
+        completed = subprocess.CompletedProcess(
+            ['tailscale', 'serve', 'status', '--json'],
+            0,
+            stdout='{"TCP":{"8443":{"TCPForward":"127.0.0.1:9443"}}}',
+            stderr='',
+        )
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            evidence_root = pathlib.Path(temp_root_text)
+            with mock.patch.object(route_state.subprocess, 'run', return_value=completed):
+                route_state._capture_command_output(
+                    evidence_root / 'pre-change',
+                    'tailscale-serve-status.json',
+                    ['tailscale', 'serve', 'status', '--json'],
+                    check=True,
+                )
+                route_state._capture_command_output(
+                    evidence_root / 'post-change',
+                    'tailscale-serve-status.json',
+                    ['tailscale', 'serve', 'status', '--json'],
+                    check=True,
+                )
+                with self.assertRaises(FileExistsError):
+                    route_state._capture_command_output(
+                        evidence_root / 'pre-change',
+                        'tailscale-serve-status.json',
+                        ['tailscale', 'serve', 'status', '--json'],
+                        check=True,
+                    )
+
+            self.assertTrue((evidence_root / 'pre-change' / 'tailscale-serve-status.json').is_file())
+            self.assertTrue((evidence_root / 'post-change' / 'tailscale-serve-status.json').is_file())
+
     def test_ensure_route_noops_on_match_and_adds_only_when_absent(self):
         route_state = load_route_state_module()
         runner = RecordingRunner()
@@ -749,7 +999,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, matching],
+                    side_effect=[absent, absent, matching],
                 ),
                 mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
             ):
@@ -766,6 +1016,34 @@ class TailscaleRouteStateTests(unittest.TestCase):
             self.assertEqual('0', state['ROUTE_PENDING'])
             self.assertEqual('1', state['ROUTE_CREATED'])
             self.assertEqual('0', state['ROUTE_PREEXISTING'])
+
+    def test_ensure_rereads_and_refuses_a_route_that_appears_before_add(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        absent = self.serve_status()
+        replacement = self.serve_status()
+        replacement['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[absent, replacement, replacement],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                with self.assertRaisesRegex(route_state.RouteConflict, 'appeared before add'):
+                    route_state.main([
+                        'ensure',
+                        '--state-file', str(state_file),
+                        '--evidence-dir', str(temp_root / 'evidence'),
+                    ])
+
+            self.assertEqual([], runner.calls)
+            self.assertEqual('1', route_state._read_state(state_file)['ROUTE_PENDING'])
 
     def test_final_ownership_write_failure_compensates_exact_created_route(self):
         route_state = load_route_state_module()
@@ -789,7 +1067,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, matching, matching, absent],
+                    side_effect=[absent, absent, matching, matching, absent],
                 ),
                 mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
                 mock.patch.object(route_state, '_write_state', side_effect=fail_final_write),
@@ -826,7 +1104,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, absent, absent],
+                    side_effect=[absent, absent, absent, absent],
                 ),
                 mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
             ):
@@ -861,7 +1139,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, conflicting, conflicting],
+                    side_effect=[absent, absent, conflicting, conflicting],
                 ),
                 mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
             ):
@@ -879,6 +1157,75 @@ class TailscaleRouteStateTests(unittest.TestCase):
             self.assertEqual('1', state['ROUTE_PENDING'])
             self.assertEqual('0', state['ROUTE_CREATED'])
             self.assertEqual('0', state['ROUTE_REMOVED'])
+
+    def test_remove_rereads_and_refuses_replacement_before_exact_off(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+        replacement = self.serve_status()
+        replacement['TCP'][str(PUBLIC_PORT)] = {'TCPForward': '127.0.0.1:60000'}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            route_state._record_route_state(
+                state_file,
+                created=True,
+                preexisting=False,
+                pending=False,
+            )
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[matching, replacement],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                with self.assertRaisesRegex(route_state.RouteConflict, 'replaced'):
+                    route_state.main([
+                        'remove',
+                        '--state-file', str(state_file),
+                        '--evidence-dir', str(temp_root / 'evidence'),
+                    ])
+
+            self.assertEqual([], runner.calls)
+            self.assertEqual('0', route_state._read_state(state_file)['ROUTE_REMOVED'])
+
+    def test_remove_refuses_exact_off_when_an_unrelated_route_changed_before_last_classification(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+        unrelated_lost = copy.deepcopy(matching)
+        unrelated_lost['TCP'].pop('8443')
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            route_state._record_route_state(
+                state_file,
+                created=True,
+                preexisting=False,
+                pending=False,
+            )
+            with (
+                mock.patch.object(
+                    route_state,
+                    '_capture_evidence',
+                    side_effect=[matching, unrelated_lost],
+                ),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                with self.assertRaisesRegex(route_state.RouteConflict, 'unrelated Serve routes changed'):
+                    route_state.main([
+                        'remove',
+                        '--state-file', str(state_file),
+                        '--evidence-dir', str(temp_root / 'evidence'),
+                    ])
+
+            self.assertEqual([], runner.calls)
 
     def test_preflight_fails_closed_on_interrupted_pending_route_state(self):
         route_state = load_route_state_module()
@@ -912,6 +1259,39 @@ class TailscaleRouteStateTests(unittest.TestCase):
             state = route_state._read_state(state_file)
             self.assertEqual('1', state['ROUTE_PENDING'])
             self.assertEqual('0', state['ROUTE_CREATED'])
+
+    def test_explicit_reconcile_preserves_later_matching_route_without_claiming_or_removing_it(self):
+        route_state = load_route_state_module()
+        runner = RecordingRunner()
+        matching = self.serve_status()
+        matching['TCP'][str(PUBLIC_PORT)] = {'TCPForward': GUARD_TARGET}
+
+        with tempfile.TemporaryDirectory() as temp_root_text:
+            temp_root = pathlib.Path(temp_root_text)
+            state_file = temp_root / 'active-operation.env'
+            route_state._record_route_state(
+                state_file,
+                created=False,
+                preexisting=False,
+                pending=True,
+            )
+            with (
+                mock.patch.object(route_state, '_capture_evidence', return_value=matching),
+                mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
+            ):
+                route_state.main([
+                    'reconcile',
+                    '--resolution', 'preserve-current',
+                    '--state-file', str(state_file),
+                    '--evidence-dir', str(temp_root / 'evidence'),
+                ])
+
+            state = route_state._read_state(state_file)
+            self.assertEqual([], runner.calls)
+            self.assertEqual('0', state['ROUTE_PENDING'])
+            self.assertEqual('0', state['ROUTE_CREATED'])
+            self.assertEqual('1', state['ROUTE_PREEXISTING'])
+            self.assertEqual('preserve-current', state['ROUTE_RECONCILIATION'])
 
     def test_remove_recaptures_even_when_owned_route_was_already_absent(self):
         route_state = load_route_state_module()
@@ -963,7 +1343,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, absent, absent, inherited],
+                    side_effect=[absent, absent, absent, absent, inherited],
                 ),
                 mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
             ):
@@ -1002,7 +1382,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[absent, matching, matching, matching, absent],
+                    side_effect=[absent, absent, matching, matching, matching, matching, absent],
                 ),
                 mock.patch.object(
                     route_state,
@@ -1055,7 +1435,7 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 mock.patch.object(
                     route_state,
                     '_capture_evidence',
-                    side_effect=[matching, matching],
+                    side_effect=[matching, matching, matching],
                 ),
                 mock.patch.object(route_state, 'SubprocessRunner', return_value=runner),
             ):
@@ -1122,16 +1502,6 @@ class TailscaleRouteStateTests(unittest.TestCase):
                 runner=runner,
                 port=PUBLIC_PORT,
                 expected_target=GUARD_TARGET,
-            )
-        self.assertEqual([], runner.calls)
-
-        with self.assertRaises(route_state.RouteConflict):
-            route_state.remove_owned_tcp_route(
-                conflicting_status,
-                runner=runner,
-                port=PUBLIC_PORT,
-                expected_target=GUARD_TARGET,
-                route_created=True,
             )
         self.assertEqual([], runner.calls)
 

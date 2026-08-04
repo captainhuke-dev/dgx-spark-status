@@ -79,3 +79,37 @@ test('Alpha-1 card still resolves to its running control profile by its own port
   assert.equal(matched?.profile_id, alphaProfile.profile_id);
   assert.equal(matched?.status, 'running');
 });
+
+test('inventory-only Studio card never attaches an unrelated enabled control on shared client port 56827', () => {
+  assert.equal(typeof findModelControlProfile, 'function');
+
+  const studioCard = {
+    key: 'unsloth-studio-live',
+    name: 'Unsloth Studio live model',
+    apiModel: 'unsloth/DeepSeek-V4-Flash-0731-GGUF',
+    port: 56827,
+    clientPort: 56827,
+    backendPort: 36321,
+    inventoryOnly: true,
+    lifecycleOwner: 'unsloth-studio',
+    exposureOwner: 'dgx-unsloth-guard'
+  };
+  const unrelatedEnabledProfile = {
+    profile_id: 'unrelated-managed-runtime',
+    display_name: 'Unrelated managed runtime',
+    port: 56827,
+    api_model_id: 'other/model',
+    control_enabled: true,
+    status: 'running'
+  };
+
+  assert.equal(
+    findModelControlProfile(
+      studioCard,
+      studioCard,
+      studioCard.clientPort,
+      [unrelatedEnabledProfile]
+    ),
+    null
+  );
+});

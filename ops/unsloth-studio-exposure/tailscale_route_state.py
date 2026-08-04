@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import contextlib
 import json
 import os
 import shlex
@@ -10,6 +11,11 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - the package targets Linux/systemd hosts
+    fcntl = None
 
 
 ROUTE_PORT = 56827
@@ -126,6 +132,51 @@ def normalize_serve_json(document: Any) -> Any:
     return normalize_node(copy.deepcopy(document))
 
 
+def _without_managed_tcp_route(document: Any, *, port: int = ROUTE_PORT) -> Any:
+    managed_port = str(port)
+
+    def remove_node(node: Any) -> Any:
+        if isinstance(node, dict):
+            cleaned: dict[str, Any] = {}
+            for key, value in node.items():
+                if key == 'TCP' and isinstance(value, dict):
+                    tcp_map = {
+                        str(route_port): remove_node(route_value)
+                        for route_port, route_value in value.items()
+                        if str(route_port) != managed_port
+                    }
+                    if tcp_map:
+                        cleaned[key] = tcp_map
+                    continue
+                if key == 'endpoints' and isinstance(value, dict):
+                    endpoints = {
+                        endpoint_key: remove_node(endpoint_value)
+                        for endpoint_key, endpoint_value in value.items()
+                        if endpoint_key != f'tcp:{managed_port}'
+                    }
+                    if endpoints:
+                        cleaned[key] = endpoints
+                    continue
+                cleaned[key] = remove_node(value)
+            return cleaned
+        if isinstance(node, list):
+            return [remove_node(item) for item in node]
+        return node
+
+    return remove_node(copy.deepcopy(document))
+
+
+def normalized_complete_route_map(document: Any, *, port: int = ROUTE_PORT) -> Any:
+    return normalize_serve_json(_without_managed_tcp_route(document, port=port))
+
+
+def assert_unrelated_routes_unchanged(before: Any, after: Any, *, port: int = ROUTE_PORT) -> None:
+    if normalized_complete_route_map(before, port=port) != normalized_complete_route_map(after, port=port):
+        raise RouteConflict(
+            f'Refusing TCP {port} route result because unrelated Serve routes changed.'
+        )
+
+
 def classify_tcp_route(document: Any, *, port: int = ROUTE_PORT, expected_target: str = EXPECTED_TARGET) -> RouteStatus:
     current = _extract_tcp_entries(document).get(str(port))
     if current is None:
@@ -182,26 +233,6 @@ def ensure_tcp_route(
         )
     if classification.status == 'absent':
         runner.run(['tailscale', 'serve', '--bg', f'--tcp={port}', _strip_target_scheme(expected_target)])
-    return classification
-
-
-def remove_owned_tcp_route(
-    document: Any,
-    *,
-    runner,
-    port: int = ROUTE_PORT,
-    expected_target: str = EXPECTED_TARGET,
-    route_created: bool,
-) -> RouteStatus:
-    classification = classify_tcp_route(document, port=port, expected_target=expected_target)
-    if not route_created:
-        return classification
-    if classification.status == 'conflicting':
-        raise RouteConflict(
-            f'Existing TCP {port} route points to {classification.existing_target}, not {expected_target}.'
-        )
-    if classification.status == 'matching':
-        runner.run(['tailscale', 'serve', '--bg', f'--tcp={port}', 'off'])
     return classification
 
 
@@ -270,6 +301,8 @@ def _record_route_state(
     preexisting: bool,
     pending: bool,
     removed: bool = False,
+    reconciliation: str = '',
+    observed_status: str = '',
 ) -> None:
     _write_state(
         state_file,
@@ -279,11 +312,13 @@ def _record_route_state(
         ROUTE_PORT=str(ROUTE_PORT),
         ROUTE_TARGET=EXPECTED_TARGET,
         ROUTE_REMOVED='1' if removed else '0',
+        ROUTE_RECONCILIATION=reconciliation,
+        ROUTE_OBSERVED_STATUS=observed_status,
     )
 
 
-def _compensate_created_route(evidence_dir: Path, runner) -> None:
-    current_document = _capture_evidence(evidence_dir)
+def _compensate_created_route(evidence_dir: Path, runner, before_document: Any) -> None:
+    current_document = _capture_evidence(evidence_dir, 'compensation-pre-off')
     current = classify_tcp_route(current_document)
     if current.status == 'conflicting':
         raise RouteConflict(
@@ -291,13 +326,17 @@ def _compensate_created_route(evidence_dir: Path, runner) -> None:
             f'{current.existing_target}.'
         )
     if current.status == 'matching':
+        assert_unrelated_routes_unchanged(before_document, current_document)
         runner.run(['tailscale', 'serve', '--bg', f'--tcp={ROUTE_PORT}', 'off'])
-        verified_document = _capture_evidence(evidence_dir)
+        verified_document = _capture_evidence(evidence_dir, 'compensation-post-off')
         verified = classify_tcp_route(verified_document)
         if verified.status != 'absent':
             raise RouteConflict(
                 f'Compensated TCP {ROUTE_PORT} route was not verified absent.'
             )
+        assert_unrelated_routes_unchanged(before_document, verified_document)
+        return
+    assert_unrelated_routes_unchanged(before_document, current_document)
 
 
 def _require_reconciled_route_state(state: dict[str, str]) -> None:
@@ -308,11 +347,31 @@ def _require_reconciled_route_state(state: dict[str, str]) -> None:
         )
 
 
+@contextlib.contextmanager
+def _exclusive_route_lock(lock_file: Path):
+    if fcntl is None:
+        raise RouteConflict('Exclusive package route locking is unavailable on this host.')
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, 'a+') as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _create_evidence_session(evidence_dir: Path, command: str) -> Path:
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=f'{command}-', dir=evidence_dir))
+
+
 def _capture_command_output(evidence_dir: Path, name: str, argv: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(argv, capture_output=True, text=True, check=False)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     output = result.stdout if result.stdout else result.stderr
-    evidence_dir.joinpath(name).write_text(output)
+    with evidence_dir.joinpath(name).open('x') as evidence_file:
+        evidence_file.write(output)
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(result.returncode, argv, output=result.stdout, stderr=result.stderr)
     return result
@@ -341,13 +400,14 @@ def _load_serve_document(evidence_dir: Path) -> Any:
     return status_document
 
 
-def _capture_evidence(evidence_dir: Path) -> Any:
-    _capture_command_output(evidence_dir, 'tailscale-version.txt', ['tailscale', 'version'], check=True)
-    _capture_command_output(evidence_dir, 'tailscale-status.json', ['tailscale', 'status', '--json'], check=True)
-    _capture_command_output(evidence_dir, 'tailscale-ipv4.txt', ['tailscale', 'ip', '-4'], check=True)
-    _capture_command_output(evidence_dir, 'tailscale-ipv6.txt', ['tailscale', 'ip', '-6'], check=False)
-    _capture_command_output(evidence_dir, 'tailscale-serve-help.txt', ['tailscale', 'serve', '--help'], check=True)
-    return _load_serve_document(evidence_dir)
+def _capture_evidence(evidence_dir: Path, phase: str = 'snapshot') -> Any:
+    phase_dir = evidence_dir / phase
+    _capture_command_output(phase_dir, 'tailscale-version.txt', ['tailscale', 'version'], check=True)
+    _capture_command_output(phase_dir, 'tailscale-status.json', ['tailscale', 'status', '--json'], check=True)
+    _capture_command_output(phase_dir, 'tailscale-ipv4.txt', ['tailscale', 'ip', '-4'], check=True)
+    _capture_command_output(phase_dir, 'tailscale-ipv6.txt', ['tailscale', 'ip', '-6'], check=False)
+    _capture_command_output(phase_dir, 'tailscale-serve-help.txt', ['tailscale', 'serve', '--help'], check=True)
+    return _load_serve_document(phase_dir)
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -366,17 +426,36 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     add_common_arguments(subparsers.add_parser('preflight'))
     add_common_arguments(subparsers.add_parser('ensure'))
     add_common_arguments(subparsers.add_parser('remove'))
+    reconcile = subparsers.add_parser('reconcile')
+    add_common_arguments(reconcile)
+    reconcile.add_argument('--resolution', required=True, choices=('preserve-current',))
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parse_args(argv)
+def _main_locked(args: argparse.Namespace) -> int:
     state_file = Path(args.state_file)
-    evidence_dir = Path(args.evidence_dir)
+    evidence_dir = _create_evidence_session(Path(args.evidence_dir), args.command)
     state = _read_state(state_file)
-    _require_reconciled_route_state(state)
-    serve_document = _capture_evidence(evidence_dir)
     runner = SubprocessRunner()
+
+    if args.command == 'reconcile':
+        if state.get('ROUTE_PENDING', '0') != '1':
+            raise RouteConflict('No interrupted ROUTE_PENDING=1 operation requires reconciliation.')
+        serve_document = _capture_evidence(evidence_dir, 'reconcile-observed')
+        classification = classify_tcp_route(serve_document)
+        _record_route_state(
+            state_file,
+            created=False,
+            preexisting=classification.status == 'matching',
+            pending=False,
+            removed=classification.status == 'absent',
+            reconciliation=args.resolution,
+            observed_status=classification.status,
+        )
+        return 0
+
+    _require_reconciled_route_state(state)
+    serve_document = _capture_evidence(evidence_dir, 'pre-change')
 
     if args.command == 'preflight':
         classification = classify_tcp_route(serve_document)
@@ -408,14 +487,25 @@ def main(argv: list[str] | None = None) -> int:
             preexisting=False,
             pending=True,
         )
+        route_add_attempted = False
         try:
-            ensure_tcp_route(serve_document, runner=runner)
-            verified_document = _capture_evidence(evidence_dir)
+            current_document = _capture_evidence(evidence_dir, 'ensure-pre-add')
+            current = classify_tcp_route(current_document)
+            if current.status != 'absent':
+                raise RouteConflict(
+                    f'Refusing TCP {ROUTE_PORT} mutation because a {current.status} route '
+                    'appeared before add; explicit operator reconciliation is required.'
+            )
+            assert_unrelated_routes_unchanged(serve_document, current_document)
+            route_add_attempted = True
+            ensure_tcp_route(current_document, runner=runner)
+            verified_document = _capture_evidence(evidence_dir, 'post-change')
             verified = classify_tcp_route(verified_document)
             if verified.status != 'matching':
                 raise RouteConflict(
                     f'Added TCP {ROUTE_PORT} route was not verified at exact target {EXPECTED_TARGET}.'
                 )
+            assert_unrelated_routes_unchanged(serve_document, verified_document)
             _record_route_state(
                 state_file,
                 created=True,
@@ -423,8 +513,10 @@ def main(argv: list[str] | None = None) -> int:
                 pending=False,
             )
         except BaseException as exc:
+            if not route_add_attempted:
+                raise
             try:
-                _compensate_created_route(evidence_dir, runner)
+                _compensate_created_route(evidence_dir, runner, serve_document)
                 _record_route_state(
                     state_file,
                     created=False,
@@ -442,19 +534,37 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     route_created = _state_claims_route_ownership(state)
-    classification = remove_owned_tcp_route(
-        serve_document,
-        runner=runner,
-        route_created=route_created,
-    )
+    classification = classify_tcp_route(serve_document)
     route_removed = state.get('ROUTE_REMOVED', '0') == '1'
     if route_created:
-        verified_document = _capture_evidence(evidence_dir)
+        if classification.status == 'conflicting':
+            raise RouteConflict(
+                f'Refusing removal because TCP {ROUTE_PORT} was replaced by '
+                f'{classification.existing_target}.'
+            )
+        current_document = _capture_evidence(evidence_dir, 'remove-pre-off')
+        current = classify_tcp_route(current_document)
+        if current.status == 'conflicting':
+            raise RouteConflict(
+                f'Refusing removal because TCP {ROUTE_PORT} was replaced by '
+                f'{current.existing_target}.'
+            )
+        if classification.status == 'absent' and current.status == 'matching':
+            raise RouteConflict(
+                f'Refusing removal because a replacement matching TCP {ROUTE_PORT} route appeared.'
+            )
+        if current.status == 'matching':
+            assert_unrelated_routes_unchanged(serve_document, current_document)
+            runner.run(['tailscale', 'serve', '--bg', f'--tcp={ROUTE_PORT}', 'off'])
+            verified_document = _capture_evidence(evidence_dir, 'post-change')
+        else:
+            verified_document = current_document
         verified = classify_tcp_route(verified_document)
         if verified.status != 'absent':
             raise RouteConflict(
                 f'Removed TCP {ROUTE_PORT} route was not verified absent.'
             )
+        assert_unrelated_routes_unchanged(serve_document, verified_document)
         route_removed = True
     _record_route_state(
         state_file,
@@ -464,6 +574,14 @@ def main(argv: list[str] | None = None) -> int:
         removed=route_removed,
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    state_file = Path(args.state_file)
+    lock_file = state_file.with_suffix('.lock')
+    with _exclusive_route_lock(lock_file):
+        return _main_locked(args)
 
 
 if __name__ == '__main__':
