@@ -260,6 +260,50 @@ class HandlerHarnessMixin:
 
 
 class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
+    def test_normalizes_top_level_max_reasoning_effort_into_chat_template_kwargs(self):
+        guard = load_guard_module()
+        body = json.dumps({
+            'model': LIVE_MODEL_ID,
+            'messages': [{'role': 'user', 'content': 'hello'}],
+            'max_tokens': 256,
+            'reasoning_effort': 'max',
+        }).encode('utf-8')
+
+        normalized = json.loads(guard.normalize_reasoning_effort(body))
+
+        self.assertEqual(normalized['reasoning_effort'], 'max')
+        self.assertEqual(
+            normalized['chat_template_kwargs']['reasoning_effort'],
+            'max',
+        )
+        self.assertEqual(normalized['messages'], json.loads(body)['messages'])
+        self.assertEqual(normalized['max_tokens'], 256)
+
+    def test_normalizes_top_level_high_reasoning_effort(self):
+        guard = load_guard_module()
+        body = json.dumps({'reasoning_effort': 'high'}).encode('utf-8')
+
+        normalized = json.loads(guard.normalize_reasoning_effort(body))
+
+        self.assertEqual(normalized['chat_template_kwargs'], {'reasoning_effort': 'high'})
+
+    def test_nested_reasoning_effort_takes_precedence(self):
+        guard = load_guard_module()
+        body = json.dumps({
+            'reasoning_effort': 'max',
+            'chat_template_kwargs': {'reasoning_effort': 'high', 'enable_thinking': True},
+        }).encode('utf-8')
+
+        normalized = guard.normalize_reasoning_effort(body)
+
+        self.assertEqual(normalized, body)
+
+    def test_reasoning_effort_none_is_not_rewritten(self):
+        guard = load_guard_module()
+        body = json.dumps({'reasoning_effort': 'none'}).encode('utf-8')
+
+        self.assertEqual(guard.normalize_reasoning_effort(body), body)
+
     def test_create_server_public_interface_uses_canonical_loopback_binding(self):
         guard = load_guard_module()
 
@@ -411,6 +455,35 @@ class RequestGuardTests(unittest.TestCase, HandlerHarnessMixin):
         self.assertNotIn('Connection', connection.request_call['headers'])
         self.assertEqual(1, resolver.resolve_calls)
         self.assertTrue(connection.closed)
+
+    def test_routes_top_level_max_effort_as_unsloth_template_kwarg(self):
+        guard = load_guard_module()
+        body = json.dumps({
+            'model': LIVE_MODEL_ID,
+            'messages': [{'role': 'user', 'content': 'hello'}],
+            'max_tokens': 256,
+            'reasoning_effort': 'max',
+        }).encode('utf-8')
+        handler, _, _, connection = self.build_handler(
+            guard,
+            method='POST',
+            path='/v1/chat/completions',
+            headers={
+                'Content-Type': 'application/json',
+                'Content-Length': str(len(body)),
+            },
+            body=body,
+        )
+
+        handler.do_POST()
+
+        forwarded = json.loads(connection.request_call['body'])
+        self.assertEqual(forwarded['reasoning_effort'], 'max')
+        self.assertEqual(
+            forwarded['chat_template_kwargs']['reasoning_effort'],
+            'max',
+        )
+        self.assertEqual(forwarded['max_tokens'], 256)
 
     def test_rejects_malformed_json(self):
         guard = load_guard_module()

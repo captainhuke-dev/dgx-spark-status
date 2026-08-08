@@ -42,6 +42,7 @@ BUDGET_FIELDS = {
     'max_completion_tokens',
     'max_output_tokens',
 }
+REASONING_EFFORT_VALUES = {'high', 'max'}
 
 
 @dataclass(slots=True)
@@ -350,6 +351,35 @@ def validate_json_budget(body: bytes, config: GuardConfig) -> None:
             )
 
 
+def normalize_reasoning_effort(body: bytes) -> bytes:
+    """Map OpenAI-style reasoning effort to the Unsloth Jinja kwargs."""
+    if not body:
+        return body
+    try:
+        document = json.loads(body.decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body
+    if not isinstance(document, dict):
+        return body
+
+    effort = document.get('reasoning_effort')
+    if effort not in REASONING_EFFORT_VALUES:
+        return body
+
+    template_kwargs = document.get('chat_template_kwargs')
+    if template_kwargs is None:
+        template_kwargs = {}
+    elif not isinstance(template_kwargs, dict):
+        return body
+    if 'reasoning_effort' in template_kwargs:
+        return body
+
+    normalized_kwargs = dict(template_kwargs)
+    normalized_kwargs['reasoning_effort'] = effort
+    document['chat_template_kwargs'] = normalized_kwargs
+    return json.dumps(document, separators=(',', ':')).encode('utf-8')
+
+
 def filter_request_headers(headers, body: bytes) -> dict[str, str]:
     filtered: dict[str, str] = {}
     for key, value in headers.items():
@@ -418,6 +448,7 @@ class RequestGuardHandler(BaseHTTPRequestHandler):
             self._enforce_request_policy()
             body = read_bounded_body(self, self.server.guard_config)
             if self.command == 'POST':
+                body = normalize_reasoning_effort(body)
                 validate_json_budget(body, self.server.guard_config)
             resolved_backend = resolve_upstream(self.server)
             upstream = self.server.upstream_connection_factory(
