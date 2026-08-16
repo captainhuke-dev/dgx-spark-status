@@ -1063,6 +1063,21 @@ function envConnectionLabel(env, runtime) {
   return [engine, port, ctxLabel].filter(Boolean).join(' · ');
 }
 
+function envDashboardClientPort(env = {}) {
+  return numericPort(env.DASHBOARD_CLIENT_PORT || env.LAN_PROXY_PORT || env.PORT);
+}
+
+function envDashboardBackendPort(env = {}) {
+  return numericPort(env.DASHBOARD_BACKEND_PORT || env.BACKEND_PORT);
+}
+
+function envDashboardProbeUrl(env = {}) {
+  const explicit = String(env.DASHBOARD_PROBE_URL || env.HEALTH_URL || '').trim();
+  if (explicit) return explicit;
+  const probePort = numericPort(env.DASHBOARD_PROBE_PORT || env.GUARD_PORT || env.PORT);
+  return probePort ? `http://${envProbeHost(env)}:${probePort}/v1/models` : null;
+}
+
 function contextLabel(ctx) {
   const parsed = Number(ctx);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
@@ -1576,7 +1591,10 @@ async function getAvailableModels() {
         const target = inventoryConfig.section === 'llama' ? models.llama : models.vllm;
         const name = envDisplayName(env);
         const displayName = name;
-        const port = env.PORT ? parseInt(env.PORT, 10) : null;
+        const configuredPort = env.PORT ? parseInt(env.PORT, 10) : null;
+        const port = envDashboardClientPort(env) || configuredPort;
+        const probeUrl = envDashboardProbeUrl(env);
+        const backendPort = envDashboardBackendPort(env) || numericPort(env.GUARD_PORT) || configuredPort;
         const ctx = envContextLength(env);
         let sizeGB = null;
         let status = 'stopped';
@@ -1591,9 +1609,9 @@ async function getAvailableModels() {
           } catch (e) {}
         }
 
-        if (port) {
+        if (probeUrl) {
           try {
-            const { stdout: modelsOut } = await execAsync(`curl -s --max-time 1 http://${envProbeHost(env)}:${port}/v1/models 2>/dev/null || true`);
+            const { stdout: modelsOut } = await execAsync(`curl -s --max-time 1 ${probeUrl} 2>/dev/null || true`);
             if (modelsOut) {
               if (/Loading model/i.test(modelsOut)) {
                 status = 'loading';
@@ -1635,13 +1653,18 @@ async function getAvailableModels() {
               : null,
             port,
             clientPort: port,
-            backendPort: port,
+            backendPort,
             host: envProbeHost(env),
             status,
             running: status === 'running',
             runtime: inventoryConfig.runtime,
             source: `custom-${inventoryConfig.runtime}-config`,
-            config: cfg
+            config: cfg,
+            dashboardDisplayOnly: envTruthy(env.DASHBOARD_DISPLAY_ONLY),
+            dashboardProbeUrl: probeUrl,
+            localEndpoint: env.LOCAL_ENDPOINT || null,
+            lanEndpoint: env.LAN_ENDPOINT || null,
+            tailscaleEndpoint: env.TAILSCALE_ENDPOINT || null
           });
         }
       } catch (e) {}
@@ -1720,6 +1743,15 @@ async function getAvailableModels() {
       models.vllm = merged.vllm;
     }
   } catch (e) {}
+
+  // A profile may explicitly own the Dashboard view without modifying or
+  // deleting any sibling preset. Keep only those flagged cards when enabled.
+  const dashboardOnlyModels = [...models.llama, ...models.vllm].filter(model => model.dashboardDisplayOnly);
+  if (dashboardOnlyModels.length) {
+    const allowed = new Set(dashboardOnlyModels);
+    models.llama = models.llama.filter(model => allowed.has(model));
+    models.vllm = models.vllm.filter(model => allowed.has(model));
+  }
 
   return models;
 }
@@ -2046,24 +2078,35 @@ async function getVllmInfo() {
 
     try {
       const { stdout: cfgOut } = await execAsync("ls -1 /etc/vllm/models/*.env 2>/dev/null || true");
-	      for (const cfg of cfgOut.trim().split(newline).filter(Boolean)) {
+	      const configEntries = cfgOut.trim().split(newline).filter(Boolean).map(cfg => {
+	        try { return { cfg, env: parseEnv(readFileSync(cfg, 'utf8')) }; } catch (e) { return null; }
+	      }).filter(Boolean);
+	      const dashboardOnlyMode = configEntries.some(entry => envTruthy(entry.env.DASHBOARD_DISPLAY_ONLY));
+	      for (const entry of configEntries) {
+	        const { cfg, env } = entry;
 	        try {
-	          const env = parseEnv(readFileSync(cfg, 'utf8'));
 	          if (!env.PORT) continue;
-            const port = parseInt(env.PORT, 10);
-            env.__file = cfg;
-            if (isDs4RuntimeCandidate(env)) continue;
-	          if (classifyEnvRuntime(env) === 'llama' || llamaProcessesByPort.has(port)) continue;
+	          if (dashboardOnlyMode && !envTruthy(env.DASHBOARD_DISPLAY_ONLY)) continue;
+	          const configuredPort = parseInt(env.PORT, 10);
+	          const port = envDashboardClientPort(env) || configuredPort;
+	          const probeUrl = envDashboardProbeUrl(env);
+	          const backendPort = envDashboardBackendPort(env) || numericPort(env.GUARD_PORT) || configuredPort;
+	            env.__file = cfg;
+	            if (isDs4RuntimeCandidate(env)) continue;
+	          if (classifyEnvRuntime(env) === 'llama' || llamaProcessesByPort.has(configuredPort)) continue;
 
 	          candidates.push({
 	            name: envDisplayName(env) || env.SERVED_MODEL_NAME || (env.MODEL_PATH || '').split('/').filter(Boolean).pop(),
-	            endpoint: `http://127.0.0.1:${env.PORT}/v1/models`,
+	            endpoint: probeUrl,
 	            port,
+	            clientPort: port,
+	            backendPort,
 	            ctxSize: envContextLength(env),
             modelPath: env.MODEL_PATH || null,
-	            apiModel: env.API_MODEL_ID || null,
-	            config: cfg,
-	            source: 'custom-vllm-config'
+            apiModel: env.API_MODEL_ID || null,
+            config: cfg,
+            source: 'custom-vllm-config',
+            dashboardDisplayOnly: envTruthy(env.DASHBOARD_DISPLAY_ONLY)
           });
         } catch (e) {}
       }
@@ -2123,10 +2166,13 @@ async function getVllmInfo() {
           modelPath,
           ctxSize,
           port: item.port,
+          clientPort: item.clientPort || item.port,
+          backendPort: item.backendPort || item.port,
           status,
           running: status === 'running',
           source: item.source,
-          config: item.config
+          config: item.config,
+          dashboardDisplayOnly: item.dashboardDisplayOnly || false
         });
       }
     }
